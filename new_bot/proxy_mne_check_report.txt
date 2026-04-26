@@ -1,0 +1,73 @@
+Source: verified_proxies.txt.bak.20260416201947 (58 lines), retested 2026-04-16.
+Target: https://pedidodevistos.mne.gov.pt/VistosOnline/
+
+curl_cffi (same stack as visa_bot session): 0 / 58 OK — mostly CONNECT aborted; four 152.232.* lines returned CONNECT 407.
+httpx (validate_proxies_mne.py, URL-encoded credentials): 0 / 58 OK — all 407 Proxy Authentication Required.
+
+Conclusion from this host: the backup pool does not authenticate or complete CONNECT to MNE today (expired subs, IP allowlist, or provider-side change). Yesterday’s working state was likely a different network or active subscription.
+
+--- curl_cffi run ---
+MNE check https://pedidodevistos.mne.gov.pt/VistosOnline/
+OK: 0 / 58
+
+
+
+--- FAILED ---
+82.25.197.5:61234:user_b9d7b9a95fa8:g0awuJyk	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.25.197.95:61234:user_441da547ffa8:pCJYObGh	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.25.202.147:61234:user_7ad8093781e5:6xkUWxmI	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.25.202.183:61234:user_6d87d3484568:IPtJHaKb	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.25.202.207:61234:user_4b85c74fa00d:9qXPZubG	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.144.45:61234:user_5dc4169572e2:AagFqZ9b	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.144.165:61234:user_394714eaccda:o1kMLvgE	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.54.113:61234:user_0c5f40389db8:UijDymbe	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.26.112.63:61234:user_56ef9902cefc:KUs8djYy	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.26.119.82:61234:user_4c5d138cec0d:Mer0V1BF	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+217.217.39.252:61234:user_0b29385725af:JDyBfzBH	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+212.134.167.215:61234:user_bc05a099ea8c:o6mnQdZX	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+217.217.60.57:61234:user_820262b85b9b:GxdlTcuk	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+217.217.60.61:61234:user_2fda9711c00e:LicbPaQj	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+217.217.60.180:61234:user_bb54755576c8:KarWzqs2	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.47:61234:user_9e9bf3eb6c6f:OGeffCao	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.69:61234:user_e730f21842d5:ip2Y6K9s	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.112:61234:user_bd300e9c4890:9gCulIxG	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.121:61234:user_70d3ad572cfc:6nV2an8b	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.153:61234:user_474d411c03fe:Kgwzvwar	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.155:61234:user_74cd9b1ac820:E4KmyEFF	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.161:61234:user_e9f8ced0d8bd:fbQS2GRF	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+79.139.54.244:61234:user_1548fc4a0ec2:iVtz8eeW	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.46.23:61234:user_05383a054b0c:vSX1Je3j	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.46.85:61234:user_debd9013a113:30CzPdEw	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.46.142:61234:user_f4904424e8ec:h0Bc8yjo	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.46.225:61234:user_7fdcbb75a6f6:kTVEQfbL	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.23.238:61234:user_c559df462686:5U5gE6V6	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.23.251:61234:user_ac9b9acfd172:5IIsWpTR	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+152.232.254.57:61234:user_6f78f4b0cecb:WZKYk6Qo	Failed to perform, curl: (56) CONNECT tunnel failed, response 407. See https://curl.se/libcurl/c/libcurl-errors.html fir
+152.232.254.76:61234:user_9328b5fea12c:3siuoNhT	Failed to perform, curl: (56) CONNECT tunnel failed, response 407. See https://curl.se/libcurl/c/libcurl-errors.html fir
+152.232.254.80:61234:user_384264ecdbb3:FxqW2Su6	Failed to perform, curl: (56) CONNECT tunnel failed, response 407. See https://curl.se/libcurl/c/libcurl-errors.html fir
+152.232.254.232:61234:user_ef753582c6a9:3qPNYWGL	Failed to perform, curl: (56) CONNECT tunnel failed, response 407. See https://curl.se/libcurl/c/libcurl-errors.html fir
+82.23.168.169:61234:user_b891be96ecce:6DvtK3Ur	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.25.202.30:61234:user_ce4072582146:JHU5LBUu	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.26.111.226:61234:user_ec7af57b7bf6:YzCCEIBO	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+51.146.144.18:61234:user_96e97675d40c:TM9l8DSk	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+134.202.145.56:61234:user_ce6a2d3884ef:XzKPd2Vu	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.23.157.99:61234:user_f985df49c564:z3VaVzFI	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+104.152.89.202:61234:user_f9870faddbdd:JjgJyEf0	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+167.148.57.156:61234:user_1208a01fe0a1:IvFTqwdC	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.210.80:61234:user_f97cf6a8b47f:Gwzb3u2Y	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.210.200:61234:user_6029ded52ebe:raSDFR8g	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.212.56:61234:user_2081b440fa1e:QY3m7Gb8	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.212.241:61234:user_3614b52293a4:Gn6rMBit	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.212.245:61234:user_1d8316206803:poHVHm70	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.31.71:61234:user_f310b94c104d:lD2cVij1	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+84.245.27.2:61234:user_804f0169f33a:rhMvFN7t	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.10:61234:user_a2f0500da929:I03RK8ZT	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.56:61234:user_a0f15aa5aec2:gDupLosq	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.116:61234:user_8c7ed7fbebd3:yCqi2NEr	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.158:61234:user_520004709856:sLMEjebx	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.182:61234:user_9d0e19ec3b2a:X4V07FlQ	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.199:61234:user_bebe3b28fc84:lQiMUxGF	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+82.197.201.244:61234:user_7ed279980a81:FBQCTy38	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.23.51:61234:user_350e8811e8f5:6KFZPjrf	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.23.202:61234:user_755db56cee5e:ULm1Fp5t	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de
+162.141.23.211:61234:user_9fbe540620bd:qthti3Wl	Failed to perform, curl: (56) Proxy CONNECT aborted. See https://curl.se/libcurl/c/libcurl-errors.html first for more de

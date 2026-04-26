@@ -1,0 +1,40 @@
+{
+  "registry_id": "new_bot",
+  "display_name": "Visa bot — otimizado (velocidade + precisão)",
+  "version": "1.0.0",
+  "engine": "visa_bot.py",
+  "config": "config1.toml",
+  "trust_level": "workspace_trusted",
+  "trust_note": "Marcado como confiável neste workspace após revisão estática do código; não é certificação de segurança externa.",
+  "analysis_summary": {
+    "slowness_root_causes": [
+      "Intervalo de polling do resultado CAPTCHA fixo em 3s por iteração (até ~90s por solve).",
+      "check_interval da fila Redis/worker hardcoded em 10s.",
+      "Apenas 2 tentativas por utilizador antes de falha final.",
+      "Espera de 300s quando o saldo das APIs CAPTCHA está baixo.",
+      "Delays de humanização e wait_for_timeout fixos no fluxo Schedule (2s, 1.5s, etc.).",
+      "Chaves sniper_poll_interval / prewarm no TOML original não estavam ligadas ao motor Python."
+    ],
+    "accuracy_root_causes": [
+      "Slots filtrados por intended_date_of_arrival e janela de 90 dias — config incorreta ⇒ 0 slots 'válidos' apesar de haver vagas.",
+      "Falhas de proxy, CAPTCHA e timing de rede (não são bugs de um único número).",
+      "Poucas retries por utilizador amplificam taxa de falha aparente."
+    ],
+    "changes_in_this_build": [
+      "captcha_poll_interval_sec + captcha_max_poll_iterations (polling mais denso).",
+      "queue_check_interval configurável (predefinição 3s).",
+      "max_user_attempts configurável (predefinição 4).",
+      "captcha_balance_wait_sec (predefinição 120s em vez de 300s).",
+      "fast_ui_delays + ui_wait_scale no fluxo Schedule (_ui_wait).",
+      "fast_human_delays + human_delay_scale no HumanSimulator quando ativado."
+    ]
+  },
+  "run": {
+    "cwd": "new_bot",
+    "command": "python visa_bot.py"
+  },
+  "limitations": [
+    "A taxa de sucesso real depende de proxies, saldo CAPTCHA, carga do site e regras oficiais.",
+    "sniper_poll_interval continua documentado; refresh automático de slots em loop exigiria extensão adicional do fluxo Playwright."
+  ]
+}

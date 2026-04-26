@@ -1,0 +1,9 @@
+# Local logs and sensitive error dumps
+logs/
+debug_screenshots/
+browser_error_reports/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]

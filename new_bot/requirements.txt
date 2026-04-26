@@ -1,0 +1,22 @@
+# Python 3.11+ recommended (stdlib tomllib)
+#
+#   python -m venv .venv
+#   source .venv/bin/activate   # Linux/macOS  (Windows: .venv\\Scripts\\activate)
+#   pip install -r requirements.txt
+#   playwright install
+#
+# On slow or flaky networks, pip may time out while talking to PyPI; that often
+# surfaces as "No matching distribution found" / "from versions: none". Retry with:
+#   export PIP_DEFAULT_TIMEOUT=300
+#   pip install --retries 10 -r requirements.txt
+#
+httpx>=0.25.2
+colorlog>=6.8.0
+redis>=5.0.0
+numpy>=1.26.0
+curl-cffi>=0.7.0
+beautifulsoup4>=4.12.0
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+pytz>=2024.1
+pandas>=2.0.0,<3

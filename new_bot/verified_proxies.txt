@@ -1,0 +1,10 @@
+143.244.56.82:80:Mylist1234residential-US-2:Saulo12345
+50.7.248.98:80:Mylist1234residential-US-3:Saulo12345
+149.6.162.2:80:Mylist1234residential-US-4:Saulo12345
+
+149.6.163.218:80:Mylist1234residential-US-6:Saulo12345
+107.155.114.38:80:Mylist1234residential-US-7:Saulo12345
+146.70.40.94:80:Mylist1234residential-US-8:Saulo12345
+107.155.114.6:80:Mylist1234residential-US-13:Saulo12345
+149.6.163.218:80:Mylist1234residential-US-14:Saulo12345
+107.155.114.38:80:Mylist1234residential-US-15:Saulo12345

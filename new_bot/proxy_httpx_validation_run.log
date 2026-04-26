@@ -1,0 +1,84 @@
+Testing 58 entries against https://pedidodevistos.mne.gov.pt/VistosOnline/ (delay=1.2s)...
+[BAD]  82.25.197.5:61234 -> 407 Proxy Authentication Required
+[BAD]  82.25.197.95:61234 -> 407 Proxy Authentication Required
+[BAD]  82.25.202.147:61234 -> 407 Proxy Authentication Required
+[BAD]  82.25.202.183:61234 -> 407 Proxy Authentication Required
+[BAD]  82.25.202.207:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.144.45:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.144.165:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.54.113:61234 -> 407 Proxy Authentication Required
+[BAD]  82.26.112.63:61234 -> 407 Proxy Authentication Required
+[BAD]  82.26.119.82:61234 -> 407 Proxy Authentication Required
+[BAD]  217.217.39.252:61234 -> 407 Proxy Authentication Required
+[BAD]  212.134.167.215:61234 -> 407 Proxy Authentication Required
+[BAD]  217.217.60.57:61234 -> 407 Proxy Authentication Required
+[BAD]  217.217.60.61:61234 -> 407 Proxy Authentication Required
+[BAD]  217.217.60.180:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.47:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.69:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.112:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.121:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.153:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.155:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.161:61234 -> 407 Proxy Authentication Required
+[BAD]  79.139.54.244:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.46.23:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.46.85:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.46.142:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.46.225:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.23.238:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.23.251:61234 -> 407 Proxy Authentication Required
+[BAD]  152.232.254.57:61234 -> 407 Proxy Authentication Required
+[BAD]  152.232.254.76:61234 -> 407 Proxy Authentication Required
+[BAD]  152.232.254.80:61234 -> 407 Proxy Authentication Required
+[BAD]  152.232.254.232:61234 -> 407 Proxy Authentication Required
+[BAD]  82.23.168.169:61234 -> 407 Proxy Authentication Required
+[BAD]  82.25.202.30:61234 -> 407 Proxy Authentication Required
+[BAD]  82.26.111.226:61234 -> 407 Proxy Authentication Required
+[BAD]  51.146.144.18:61234 -> 407 Proxy Authentication Required
+[BAD]  134.202.145.56:61234 -> 407 Proxy Authentication Required
+[BAD]  82.23.157.99:61234 -> 407 Proxy Authentication Required
+[BAD]  104.152.89.202:61234 -> 407 Proxy Authentication Required
+[BAD]  167.148.57.156:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.210.80:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.210.200:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.212.56:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.212.241:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.212.245:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.31.71:61234 -> 407 Proxy Authentication Required
+[BAD]  84.245.27.2:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.10:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.56:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.116:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.158:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.182:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.199:61234 -> 407 Proxy Authentication Required
+[BAD]  82.197.201.244:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.23.51:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.23.202:61234 -> 407 Proxy Authentication Required
+[BAD]  162.141.23.211:61234 -> 407 Proxy Authentication Required
+
+Kept 0 / 58 lines -> verified_proxies_mne_ok.txt
+Report -> proxy_validation_report.txt
+
+Removed summary (first 20):
+  82.25.197.5:61234: 407 Proxy Authentication Required
+  82.25.197.95:61234: 407 Proxy Authentication Required
+  82.25.202.147:61234: 407 Proxy Authentication Required
+  82.25.202.183:61234: 407 Proxy Authentication Required
+  82.25.202.207:61234: 407 Proxy Authentication Required
+  51.146.144.45:61234: 407 Proxy Authentication Required
+  51.146.144.165:61234: 407 Proxy Authentication Required
+  51.146.54.113:61234: 407 Proxy Authentication Required
+  82.26.112.63:61234: 407 Proxy Authentication Required
+  82.26.119.82:61234: 407 Proxy Authentication Required
+  217.217.39.252:61234: 407 Proxy Authentication Required
+  212.134.167.215:61234: 407 Proxy Authentication Required
+  217.217.60.57:61234: 407 Proxy Authentication Required
+  217.217.60.61:61234: 407 Proxy Authentication Required
+  217.217.60.180:61234: 407 Proxy Authentication Required
+  79.139.54.47:61234: 407 Proxy Authentication Required
+  79.139.54.69:61234: 407 Proxy Authentication Required
+  79.139.54.112:61234: 407 Proxy Authentication Required
+  79.139.54.121:61234: 407 Proxy Authentication Required
+  79.139.54.153:61234: 407 Proxy Authentication Required

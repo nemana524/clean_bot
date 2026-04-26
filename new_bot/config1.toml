@@ -1,0 +1,199 @@
+# =================================================================================
+# new_bot — otimizações de velocidade e taxa de sucesso (visa_bot.py)
+# Copie verified_proxies.txt, creds_2.csv, second_form_mapping_2.json para esta pasta
+# ou ajuste os caminhos abaixo.
+# =================================================================================
+
+# =================================================================================
+# CAPTCHA — SISTEMA DUAL-SERVICE COM PRIORIDADES
+# =================================================================================
+captcha_solver_api = "anti-captcha"
+captcha_dual_service = true
+captcha_primary   = "anti-captcha"
+captcha_secondary = "2captcha"
+captcha_timeout_primary   = 90
+captcha_timeout_secondary = 90
+captcha_timeout_fallback  = 90
+# true = no login, se Anti/2Captcha nao resolverem dentro do orcamento
+# seguro, NAO cai para CapMonster/CapSolver. Abortamos antes do POST /login
+# para preservar as tentativas restantes do contador ReCaptcha do MNE.
+captcha_skip_backup_providers_on_login = false
+
+# Polling do resultado CAPTCHA (antes: 3s fixo; mais baixo = resposta mais rápida quando pronto)
+captcha_poll_interval_sec = 1.5
+captcha_max_poll_iterations = 60
+
+# Idade MÁXIMA do token reCAPTCHA antes de submetermos o POST /login.
+# A Google só aceita tokens até 120s; subtraímos margem para o POST + verify
+# do lado do MNE. Se o solver demorar mais que isto, abortamos a submissão
+# (não gastamos POST /login com um token DOA que devolveria
+# "Foi encontrado um erro ao executar a operação." e penalizaria o proxy
+# como se fosse um servidor a rejeitar).
+captcha_max_token_age_seconds = 110
+
+# true = começa a resolver o CAPTCHA enquanto a Authentication.jsp ainda está
+# a navegar/carregar. Reduz o tempo morto entre o preenchimento dos campos e
+# o aparecimento do check do reCAPTCHA.
+captcha_prewarm_on_login_navigation = true
+
+anti_captcha_api_key = [
+  "4b3f3ddf9569d07d3e66c47faa76f84b",
+  "f7772963b2e9974ee7e91c1da18e274f",
+  "fc636707e6c69d93116eb45ae1a98dfd",
+  "51cfd3edeca41fc08e0ac3e4de89c884",
+  "417a60094923c1a0a463df174e2bcadb",
+  "b1b0b96c51acd4ba4333d3eddb64ab9a",
+  "1de98a29086aa627c2a3e9085bab57a2"
+]
+twocaptcha_api_key = [
+  "f29a22fb1f956499db93706323d1d266",
+  "8945d1e803c52e98a888c7e8dd0376e8"
+]
+capmonster_api_key = [
+  "ce7d4529a80c407501dfbfbb5d5a8bbd",
+  "09fb5674452d54cbdfb45b6dc56b8e19"
+]
+capsolver_api_key = "CAP-D09F9ADF91258845DBD724E3D8C3069F0E4AFD8666D9260F44D34891884DA409"
+SITE_KEY = '6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4'
+
+# =================================================================================
+# PROXY
+# =================================================================================
+# false = usar tráfego directo pela ligação local desta máquina.
+use_proxy = true
+# Necessário quando use_proxy=false para permitir saída pelo IP local.
+allow_direct_traffic = false
+use_proxy_api = false
+use_dynamic_proxy = false
+proxy_geo_code = "pt"
+proxy_super_param = true
+proxy_transparency = false
+# "auto" uses Webshare API when webshare_api_key is filled; otherwise it falls back to proxy_file_path.
+proxy_source = "auto"
+webshare_api_key = "u7ym5by4msctxdpx7ol7mienoaynz5hovvq6pzru"
+webshare_mode = "backbone"
+# "download" preserves Webshare dashboard format, including p.webshare.io:80.
+webshare_fetch_method = "download"
+# Optional. Fill only if Webshare requires a specific plan for your account.
+webshare_plan_id = ""
+# Optional. Leave blank; the bot can request a download token with your API key.
+webshare_download_token = ""
+# Empty means all countries available in your Webshare plan.
+webshare_country_codes = ""
+# Optional comma-separated blacklist, for example: "CN,RU,IR"
+webshare_excluded_country_codes = "CN,RU,IR"
+webshare_page_size = 100
+webshare_max_proxies = 0
+webshare_api_timeout_sec = 20
+webshare_api_fallback_to_file = true
+proxy_file_path = "verified_proxies_alt_test.txt"
+creds_file_path = "creds_alt_test.csv"
+
+# =================================================================================
+# BOOKING — precisão: alinhar intended_date_of_arrival com slots reais (regra do site)
+# =================================================================================
+consular_post_id = "5084"
+nationality_of_country = "CPV"
+country_of_residence = "IRL"
+intended_date_of_arrival = "2026/08/21"
+duration_of_stay = "7"
+days_before_arrival = "1"
+target_booking_date = ""
+
+# =================================================================================
+# SNIPER / SESSÃO (documentação — refresh periódico pode ser adicionado ao fluxo Playwright)
+# =================================================================================
+prewarm_mode = true
+sniper_poll_interval = 7
+sniper_keepalive = 90
+
+# =================================================================================
+# PERFORMANCE + FILA (novo_bot)
+# =================================================================================
+# Menos paralelismo = menos pedidos simultâneos ao mesmo destino (menos risco de 403/WAF).
+# Com 1 proxy no ficheiro: 1 worker evita disputa de lease e chunks vazios.
+max_concurrent_users_per_process = 1
+max_workers = 1
+
+# Antes: BLPOP/check_interval fixo 10s — reduz latência quando a fila está vazia
+queue_check_interval = 3
+
+# Tentativas por utilizador (baixo = menos martelamento em falhas)
+max_user_attempts = 1
+
+# Retentativas de login (Playwright / rotação de proxy na mesma sessão)
+login_playwright_retry_max = 1
+# Quantas chaves Anti-Captcha diferentes tentar por utilizador (não aumentar agressivamente)
+max_captcha_key_rotations = 1
+# Tentativas de create_session antes de desistir
+create_session_max_tries = 2
+# Segundos entre retentativas após rotação de proxy no fluxo Login (none_result)
+login_proxy_retry_sleep_sec = 45
+
+# Pausa global (minutos) após falhas graves — todos os workers esperam (Redis + relógio local por processo)
+# Reduzido (antes: 180/240/90/25) para permitir recuperação em minutos em vez de horas.
+global_throttle_minutes_on_403 = 15
+global_throttle_minutes_on_recaptcha_quota = 20
+global_throttle_minutes_on_blocked_site = 10
+# Após falha classificada como captcha (solver) antes de novas tentativas
+global_throttle_minutes_after_soft_captcha = 10
+
+# Espera quando saldo CAPTCHA baixo (antes: 300s)
+captcha_balance_wait_sec = 120
+
+# Atalhos de UI no Schedule (mantém legibilidade; reduz esperas fixas)
+fast_ui_delays = true
+ui_wait_scale = 0.62
+
+# Humanização mais rápida (opcional; pode aumentar deteção — testar)
+fast_human_delays = true
+human_delay_scale = 0.55
+
+# =================================================================================
+# CONFIGURAÇÕES ADICIONAIS
+# =================================================================================
+# Alinhar com o fluxo manual (ex.: selector "English" no portal). PT também é válido se preferir.
+# O JS do login envia sempre language=PT no POST /login; alinhar a página (?language=) evita inconsistência de sessão.
+language = "PT"
+headless_mode = true
+# Anexar a Chrome/Chromium ja aberto: ex. http://127.0.0.1:9222
+# Ligue com: google-chrome --remote-debugging-port=9222  (ou variavel CDP_ENDPOINT)
+# Com CDP, headless_mode e ignorado; o pool de contextos e desactivado.
+cdp_endpoint = ""
+# true = todas as mensagens console da pagina em INFO (verbose)
+log_browser_console = false
+# true = mata Chrome/Playwright temporario deixado por runs interrompidas
+# antes de iniciar um novo ciclo, para nao herdar browsers presos em proxy antigo.
+cleanup_orphaned_playwright_browsers_on_start = true
+second_form_json_file = "second_form_mapping_2.json"
+log_level = "INFO"
+logger_console_level = "INFO"
+logger_file_level = "INFO"
+log_to_file = true
+
+# false avoids injecting cookies created by curl_cffi into Playwright. This is
+# safer with rotating/backbone proxies because each connection may get a
+# different assigned residential IP.
+tls_preflight_inject_cookies = false
+
+# Captura em falhas Playwright: texto visível + HTML + screenshot (ver browser_error_reports/)
+browser_error_max_text_chars = 12000
+browser_error_max_html_chars = 16000
+# false = leave Chrome/jQuery native AJAX headers intact.
+# true is legacy/debug only; forcing stale headers can make MNE reject /login.
+login_post_header_override = false
+
+[telegram]
+bot_token = "8650079864:AAHMTeqOx6BPVmFmYNVQciZZzSAEqOvEP3Q"
+chat_id = "7190800330"
+
+[telegram_secondary]
+enabled = true
+bot_token = "8513169219:AAGvI6pZ-mdE2-RNK4QfSzWikpt4rw8TEZE"
+chat_id = "719080033123"
+
+[account_creator]
+default_password = "SuaSenhaForte123!"
+proxy_file = "verified_proxies.txt"
+output_file = "novas_contas.csv"
+email_timeout = 180

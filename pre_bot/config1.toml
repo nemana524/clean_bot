@@ -1,0 +1,121 @@
+# =================================================================================
+# CONFIGURAÇÕES GERAIS (DEVEM FICAR NO TOPO, SEM COLCHETES ANTES)
+# =================================================================================
+
+# =================================================================================
+# CAPTCHA — SISTEMA DUAL-SERVICE COM PRIORIDADES
+# =================================================================================
+# Estratégia: Anti-Captcha (primário) + 2Captcha (secundário) em paralelo
+# Quem responder primeiro ganha. CapMonster e CapSolver como fallback.
+#
+# Prioridade:
+#   1. anti-captcha  (7 keys — melhor qualidade, usar em paralelo)
+#   2. 2captcha      (2 keys — alternativa rápida)
+#   3. capmonster    (2 keys — backup)
+#   4. capsolver     (1 key  — último recurso, falha às vezes)
+
+# Provider primário (usado no modo single-service)
+captcha_solver_api = "anti-captcha"
+
+# Modo dual-service: dispara 2 providers em paralelo e usa o mais rápido
+captcha_dual_service = true
+captcha_primary   = "anti-captcha"   # provider primário
+captcha_secondary = "2captcha"       # provider secundário em paralelo
+
+# Timeout por provider (segundos) — se ultrapassar, tenta o próximo
+captcha_timeout_primary   = 60
+captcha_timeout_secondary = 60
+captcha_timeout_fallback  = 90
+
+# Anti-Captcha — 7 keys, rotação automática entre utilizadores
+anti_captcha_api_key = [
+  "4b3f3ddf9569d07d3e66c47faa76f84b",
+  "f7772963b2e9974ee7e91c1da18e274f",
+  "fc636707e6c69d93116eb45ae1a98dfd",
+  "51cfd3edeca41fc08e0ac3e4de89c884",
+  "417a60094923c1a0a463df174e2bcadb",
+  "b1b0b96c51acd4ba4333d3eddb64ab9a",
+  "1de98a29086aa627c2a3e9085bab57a2"
+]
+
+# 2Captcha — 2 keys, fallback/paralelo
+twocaptcha_api_key = [
+  "f29a22fb1f956499db93706323d1d266",
+  "8945d1e803c52e98a888c7e8dd0376e8"
+]
+
+# CapMonster — 2 keys, backup
+capmonster_api_key = [
+  "ce7d4529a80c407501dfbfbb5d5a8bbd",
+  "09fb5674452d54cbdfb45b6dc56b8e19"
+]
+
+# CapSolver — 1 key, último recurso (falha às vezes)
+capsolver_api_key = "CAP-D09F9ADF91258845DBD724E3D8C3069F0E4AFD8666D9260F44D34891884DA409"
+
+# Chave do Site (Não alterar)
+SITE_KEY = '6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4'
+
+# =================================================================================
+# PROXY
+# =================================================================================
+use_proxy = true
+use_proxy_api = false
+use_dynamic_proxy = false
+proxy_geo_code = "pt"
+proxy_super_param = true
+proxy_transparency = false
+proxy_file_path = "verified_proxies.txt"
+creds_file_path = "creds_2.csv"
+
+# =================================================================================
+# BOOKING
+# =================================================================================
+consular_post_id = "2032"
+nationality_of_country = "CPV"
+country_of_residence = "IRL"
+intended_date_of_arrival = "2026/08/21"
+duration_of_stay = "7"
+days_before_arrival = "1"
+target_booking_date = ""
+
+# =================================================================================
+# SNIPER — PRE-WARMING + POLLING
+# =================================================================================
+prewarm_mode = true
+sniper_poll_interval = 7    # segundos entre cada polling dos slots
+sniper_keepalive = 90       # segundos entre keepalives da sessão
+
+# =================================================================================
+# PERFORMANCE
+# =================================================================================
+max_concurrent_users_per_process = 5
+
+# =================================================================================
+# CONFIGURAÇÕES ADICIONAIS
+# =================================================================================
+language = "PT"
+headless_mode = true
+second_form_json_file = "second_form_mapping_2.json"
+log_level = "INFO"
+
+# Logger
+logger_console_level = "INFO"
+logger_file_level = "INFO"
+log_to_file = false
+
+# =================================================================================
+# TELEGRAM
+# =================================================================================
+[telegram]
+bot_token = "8650079864:AAHMTeqOx6BPVmFmYNVQciZZzSAEqOvEP3Q"
+chat_id = "7190800330"
+
+# =================================================================================
+# CRIADOR DE CONTAS
+# =================================================================================
+[account_creator]
+default_password = "SuaSenhaForte123!"
+proxy_file = "verified_proxies.txt"
+output_file = "novas_contas.csv"
+email_timeout = 180
