@@ -33,6 +33,7 @@ from playwright_stealth import Stealth
 import gc
 import pytz
 import threading
+from urllib.parse import quote
 
 # =================================================================================
 # SCRIPT DE STEALTH AVANÇADO (GHOST MODE DINÂMICO)
@@ -595,11 +596,10 @@ class TLSClient:
     def _apply_proxy(self, proxy_raw: str):
         """Converte 'ip:port:user:pwd' para o formato do curl_cffi."""
         try:
-            parts = proxy_raw.strip().split(":")
-            if len(parts) < 4:
+            proxy_url = _proxy_to_http_url(proxy_raw)
+            if not proxy_url:
+                safe_print(f"[TLSClient] Formato de proxy invalido: {_proxy_log_label(proxy_raw)}")
                 return
-            ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
-            proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
             self.session.proxies = {
                 "http":  proxy_url,
                 "https": proxy_url,
@@ -631,9 +631,14 @@ class TLSClient:
             resp = await loop.run_in_executor(None, _do_get)
             self._cookies      = dict(resp.cookies)
             self._resp_headers = dict(resp.headers)
+            try:
+                resp_text = str(resp.text or "")
+            except Exception:
+                resp_text = ""
 
+            preflight_icon = "✅" if resp.status_code < 500 else "⚠️"
             safe_print(
-                f"[TLSClient] ✅ Preflight OK — status={resp.status_code} "
+                f"[TLSClient] {preflight_icon} Preflight HTTP status={resp.status_code} "
                 f"ja3={self.impersonate} cookies={list(self._cookies.keys())}"
             )
             return {
@@ -641,10 +646,11 @@ class TLSClient:
                 "ja3":     self.impersonate,
                 "cookies": self._cookies,
                 "headers": self._resp_headers,
+                "text":    resp_text[:500],
             }
         except Exception as e:
             safe_print(f"[TLSClient] ⚠️ Preflight falhou (nao critico): {e}")
-            return {"status": 0, "ja3": self.impersonate, "cookies": {}, "headers": {}}
+            return {"status": 0, "ja3": self.impersonate, "cookies": {}, "headers": {}, "text": ""}
 
     async def stealth_context(self, browser, extra_http_headers: dict = None,
                                viewport_size: dict = None, locale: str = "pt-BR",
@@ -1070,11 +1076,24 @@ def _is_site_unavailable_error(err: str) -> bool:
     )
 
 
+def _is_proxy_provider_quota_error(err: str) -> bool:
+    """Webshare/proxy-provider quota or billing exhaustion before reaching MNE."""
+    s = _normalize_server_text(err).lower()
+    return (
+        "response 402" in s
+        or " 402" in s
+        or "402 payment" in s
+        or "bandwidth" in s and ("exhaust" in s or "allowance" in s or "quota" in s)
+        or "you've used up all your bandwidth" in s
+    )
+
+
 def _login_fatal_skip_captcha_key_rotate(err: str) -> bool:
     return (
         _is_server_login_rejection(err)
         or _is_ip_banned_http_error(err)
         or _is_site_unavailable_error(err)
+        or _is_proxy_provider_quota_error(err)
     )
 
 
@@ -1183,6 +1202,68 @@ def _proxy_log_label(proxy_raw: Optional[str]) -> str:
         return "?"
 
 
+def _proxy_safe_label(proxy_raw: Optional[str]) -> str:
+    """Human-readable proxy label without exposing the proxy password."""
+    parsed = _parse_proxy_raw(proxy_raw)
+    if not parsed:
+        return _proxy_log_label(proxy_raw)
+    host, port, username, _ = parsed
+    if len(username) <= 10:
+        safe_user = username
+    else:
+        safe_user = f"{username[:6]}...{username[-4:]}"
+    return f"{host}:{port}:{safe_user}"
+
+
+def _parse_proxy_raw(proxy_raw: Optional[str]) -> Optional[Tuple[str, str, str, str]]:
+    """Parse bot proxy format as host:port:username:password."""
+    if _is_direct_proxy(proxy_raw):
+        return None
+    parts = str(proxy_raw or "").strip().split(":", 3)
+    if len(parts) != 4:
+        return None
+    host, port, username, password = (part.strip() for part in parts)
+    if not host or not port or not username or not password:
+        return None
+    return host, port, username, password
+
+
+def _proxy_to_http_url(proxy_raw: str) -> Optional[str]:
+    parsed = _parse_proxy_raw(proxy_raw)
+    if not parsed:
+        return None
+    host, port, username, password = parsed
+    scheme = "http"
+    try:
+        if scraper_settings is not None:
+            scheme = str(scraper_settings.get("proxy_scheme") or scheme).strip().lower()
+    except Exception:
+        pass
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        scheme = "http"
+    return f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+
+
+def _proxy_to_playwright_config(proxy_raw: Optional[str]) -> Optional[Dict[str, str]]:
+    parsed = _parse_proxy_raw(proxy_raw)
+    if not parsed:
+        return None
+    host, port, username, password = parsed
+    scheme = "http"
+    try:
+        if scraper_settings is not None:
+            scheme = str(scraper_settings.get("proxy_scheme") or scheme).strip().lower()
+    except Exception:
+        pass
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        scheme = "http"
+    return {
+        "server": f"{scheme}://{host}:{port}",
+        "username": username,
+        "password": password,
+    }
+
+
 def _cookie_pool_key(proxy_raw: Optional[str], username: Optional[str] = None) -> str:
     """
     Key for cookie/session reuse.
@@ -1235,6 +1316,33 @@ def _force_stop_process_pool(executor, grace_seconds: float = 3.0) -> tuple[int,
 
     terminated = 0
     killed = 0
+
+    if os.name == "nt":
+        # On Windows, ProcessPool workers can leave Playwright Chrome children
+        # behind if only the Python process is terminated. Kill the whole tree.
+        for proc in live:
+            pid = getattr(proc, "pid", None)
+            if not pid:
+                continue
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    check=False,
+                )
+                if result.returncode == 0:
+                    killed += 1
+            except Exception:
+                pass
+        for proc in live:
+            try:
+                proc.join(timeout=0.5)
+            except Exception:
+                pass
+        return 0, killed
 
     for proc in live:
         try:
@@ -1561,6 +1669,7 @@ class ProxyLeaseManager:
         self._leases:     Dict[str, str] = {}  # proxy -> username
         self._user_proxy: Dict[str, str] = {}  # username -> proxy
         self._banned_mem: Dict[str, float] = {}  # proxy -> ban_until timestamp
+        self._uses_mem:   Dict[str, int] = {}  # proxy -> total uses in this process
 
     # ─────────────────────────────────────────────────────────────────────────
     # INTERFACE PUBLICA
@@ -1602,6 +1711,8 @@ class ProxyLeaseManager:
             ttl = self._BAN_RECAPTCHA_SOFT_S
         elif reason == "recaptcha_server_quota":
             ttl = self._BAN_RECAPTCHA_QUOTA_S
+        elif reason == "site_unavailable":
+            ttl = max(60, _cfg_int("proxy_ban_seconds_on_site_unavailable", 300))
         else:
             # Ler numero de falhas para decidir o nivel de ban
             fails = self._get_fail_count(proxy_raw)
@@ -1623,9 +1734,10 @@ class ProxyLeaseManager:
         # Fallback memory
         with self._lock:
             self._banned_mem[proxy_raw] = time.time() + ttl
+            _pid = _proxy_safe_label(proxy_raw)
             safe_print(
-                f"[PLM] 🚫 BAN(mem) {proxy_raw.split(':')[0]} "
-                f"por {ttl//60}min (motivo={reason})"
+                f"[PLM] 🚫 BAN(mem) {_pid} "
+                f"por {ttl}s (motivo={reason})"
             )
 
     def rotate(self, username: str, bad_proxy: str, proxy_list: list,
@@ -1861,14 +1973,16 @@ class ProxyLeaseManager:
                 owner = self._leases.get(p)
                 if owner and owner != username:
                     continue
-                candidates.append(p)
+                candidates.append((p, self._uses_mem.get(p, 0), random.random()))
 
             if not candidates:
                 return None
 
-            chosen = candidates[0]  # primeiro = menos usos (lista ja ordenada)
+            candidates.sort(key=lambda item: (item[1], item[2]))
+            chosen = candidates[0][0]
             self._leases[chosen]       = username
             self._user_proxy[username] = chosen
+            self._uses_mem[chosen] = self._uses_mem.get(chosen, 0) + 1
             return chosen
 
     def _release_memory(self, username: str):
@@ -2273,11 +2387,11 @@ browser_context_pool: Optional[BrowserContextPool] = None
 def pre_flight_warmup(proxy_raw: str, process_id: int):
     """Faz uma requisição leve para 'aquecer' a conexão do proxy."""
     try:
-        parts = proxy_raw.split(":")
-        if len(parts) < 4: return False
-        
-        ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
-        proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+        parsed_proxy = _parse_proxy_raw(proxy_raw)
+        proxy_url = _proxy_to_http_url(proxy_raw)
+        if not parsed_proxy or not proxy_url:
+            return False
+        ip, port, _, _ = parsed_proxy
         
         proxies = {"http://": proxy_url, "https://": proxy_url}
         
@@ -2886,6 +3000,71 @@ def _cleanup_orphaned_playwright_browsers(settings: Optional[Dict] = None) -> in
         return 0
 
 
+def _cleanup_orphaned_bot_processes(settings: Optional[Dict] = None) -> int:
+    """Kill stale multiprocessing child workers left after interrupted runs."""
+    effective_settings = settings or scraper_settings or {}
+    if os.name != "nt":
+        return 0
+    if not _coerce_bool(
+        effective_settings.get("cleanup_orphaned_playwright_browsers_on_start", True),
+        True,
+    ):
+        return 0
+
+    current_pid = os.getpid()
+    ps_query = rf"""
+Get-CimInstance Win32_Process |
+Where-Object {{
+  $_.ProcessId -ne {current_pid} -and
+  $_.Name -match '^(python|pythonw|py)\.exe$' -and
+  ($_.CommandLine -match 'multiprocessing-fork' -or
+   $_.CommandLine -match 'spawn_main') -and
+  -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue)
+}} |
+Select-Object -ExpandProperty ProcessId
+"""
+    try:
+        query = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_query],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        pids = []
+        for line in (query.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        if not pids:
+            return 0
+
+        killed = 0
+        for pid in pids:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if result.returncode == 0:
+                killed += 1
+
+        if killed:
+            logging.getLogger().warning(
+                f"[StartupCleanup] Killed {killed} orphaned bot Python process tree(s): {pids}"
+            )
+        return killed
+    except Exception as cleanup_err:
+        logging.getLogger().warning(
+            f"[StartupCleanup] Failed to clear orphaned bot Python processes: {cleanup_err}"
+        )
+        return 0
+
+
 def setup_logging(process_id: int = 0, settings: Optional[Dict] = None):
     """Setup logging for each process with Process ID prefix"""
     effective_settings = settings or scraper_settings or {}
@@ -3162,11 +3341,9 @@ def get_timezone_from_proxy(proxy_raw: str) -> str:
     Isto engana firewalls avançados (Cloudflare, etc) que bloqueiam scripts Python.
     """
     try:
-        parts = proxy_raw.strip().split(":")
-        if len(parts) < 4: return "Europe/Lisbon"
-        
-        ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
-        proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+        proxy_url = _proxy_to_http_url(proxy_raw)
+        if not proxy_url:
+            return "Europe/Lisbon"
         
         # TENTA COM CURL_CFFI (Modo Elite)
         try:
@@ -3249,18 +3426,18 @@ def test_proxy_list(proxy_list: list[str], current_ip: str) -> tuple[httpx.HTTPT
         if not proxy_raw: continue
             
         try:
-            parts = proxy_raw.strip().split(":")
-            if len(parts) < 4: continue
-                
-            ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
-            proxy_url = f"http://{user}:{pwd}@{ip}:{port}"
+            parsed_proxy = _parse_proxy_raw(proxy_raw)
+            proxy_url = _proxy_to_http_url(proxy_raw)
+            if not parsed_proxy or not proxy_url:
+                continue
+            ip, port, _, _ = parsed_proxy
             
             # TESTE AGRESSIVO: 5 Segundos total para carregar a página inicial
             # Isso simula a paciência de um usuário real e a velocidade de um sniper bot
             start_time = time.time()
             
             response = curl_requests.get(
-                "https://pedidodevistos.mne.gov.pt/VistosOnline/", 
+                "https://api.ipify.org?format=json", 
                 proxies={"http": proxy_url, "https": proxy_url}, 
                 impersonate="chrome110",
                 timeout=5.0, # <--- TIMEOUT REDUZIDO DE 10s PARA 5s
@@ -3365,7 +3542,7 @@ def create_session(proxy_list: list, user_agent: str,
             f"Nao e possivel criar sessao — adicione mais proxies ao ficheiro."
         )
 
-    logger.info(f"[Session] 🔒 Proxy exclusivo adquirido: {username} -> {proxy_raw.split(':')[0]}")
+    logger.info(f"[Session] 🔒 Proxy exclusivo adquirido: {username} -> {_proxy_safe_label(proxy_raw)}")
 
     # ── PASSO 2: Testar conectividade — ate 3 proxies diferentes se necessario ─
     # Se o proxy adquirido nao responder, rodar para um novo (ban + novo acquire)
@@ -3375,8 +3552,8 @@ def create_session(proxy_list: list, user_agent: str,
     proxy_test_timeout = _cfg_float("proxy_connectivity_timeout_sec", 12.0)
 
     for _rot in range(MAX_PROXY_ROTATIONS):
-        parts = proxy_raw.strip().split(":")
-        if len(parts) < 4:
+        parsed_proxy = _parse_proxy_raw(proxy_raw)
+        if not parsed_proxy:
             logger.error(f"[Session] Formato invalido: {proxy_raw}")
             proxy_raw = proxy_lease_manager.rotate(
                 username, proxy_raw, proxy_list, reason="invalid_format"
@@ -3385,22 +3562,46 @@ def create_session(proxy_list: list, user_agent: str,
                 break
             continue
 
-        ip, port, puser, ppwd = parts[0], parts[1], parts[2], parts[3]
-        proxy_url = f"http://{puser}:{ppwd}@{ip}:{port}"
+        ip, port, puser, ppwd = parsed_proxy
+        proxy_url = _proxy_to_http_url(proxy_raw)
+        if not proxy_url:
+            logger.error(f"[Session] Formato invalido: {proxy_raw}")
+            proxy_raw = proxy_lease_manager.rotate(
+                username, proxy_raw, proxy_list, reason="invalid_format"
+            )
+            if not proxy_raw:
+                break
+            continue
         proxy_id = f"{ip}:{port}"
         if proxy_id not in attempted_proxies:
             attempted_proxies.append(proxy_id)
 
         try:
             start_t = time.time()
+            proxy_validation_url = "https://api.ipify.org?format=json"
+            try:
+                if scraper_settings is not None:
+                    proxy_validation_url = str(
+                        scraper_settings.get("proxy_validation_url") or proxy_validation_url
+                    ).strip() or proxy_validation_url
+            except Exception:
+                pass
             resp = curl_requests.get(
-                "https://pedidodevistos.mne.gov.pt/VistosOnline/",
+                proxy_validation_url,
                 proxies={"http": proxy_url, "https": proxy_url},
                 impersonate="chrome120",
                 timeout=proxy_test_timeout,
                 allow_redirects=True,
             )
             latency_ms = int((time.time() - start_t) * 1000)
+            validator_exit_ip = ""
+            try:
+                if "json" in proxy_validation_url.lower():
+                    validator_exit_ip = str((resp.json() or {}).get("ip") or "").strip()
+                if not validator_exit_ip:
+                    validator_exit_ip = str(resp.text or "").strip().splitlines()[0][:80]
+            except Exception:
+                validator_exit_ip = ""
 
             if resp.status_code == 403:
                 # 403 = IP banido pelo site — ban imediato de 30 min
@@ -3416,7 +3617,10 @@ def create_session(proxy_list: list, user_agent: str,
                 continue
 
             if resp.status_code >= 400:
-                logger.warning(f"[Session] HTTP {resp.status_code} em {ip} — rotacionando...")
+                logger.warning(
+                    f"[Session] Proxy validator HTTP {resp.status_code} em {ip} "
+                    f"({proxy_validation_url}) — rotacionando..."
+                )
                 # rotate() já chama ban_proxy() internamente
                 proxy_raw = proxy_lease_manager.rotate(
                     username, proxy_raw, proxy_list, reason="http_error"
@@ -3430,13 +3634,19 @@ def create_session(proxy_list: list, user_agent: str,
                 state_manager.update_proxy_score(proxy_raw, 15, latency_ms=latency_ms)
             transport = httpx.HTTPTransport(proxy=httpx.Proxy(proxy_url))
             logger.info(
-                f"[Session] ✅ Proxy OK: {ip} | "
-                f"lat={latency_ms}ms | user={username}"
+                f"[Session] ✅ Proxy OK: {_proxy_safe_label(proxy_raw)} | "
+                f"exit_ip={validator_exit_ip or 'unknown'} | "
+                f"validator={proxy_validation_url} | lat={latency_ms}ms | user={username}"
             )
             break
 
         except Exception as e:
             err_str = str(e).lower()
+            if _is_proxy_provider_quota_error(err_str):
+                raise RuntimeError(
+                    "[Proxy] Provider recusou o tunnel com 402/quota. "
+                    "Verifique/adquira bandwidth no Webshare antes de rodar o bot."
+                ) from e
             logger.warning(f"[Session] Proxy {ip} falhou: {e}")
             if state_manager:
                 state_manager.update_proxy_score(proxy_raw, -10)
@@ -3587,17 +3797,44 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
     _proxy_task_data = None  # Dados do proxy formatados para a API de CAPTCHA
     if proxy_raw and not _is_direct_proxy(proxy_raw):
         try:
-            _parts = proxy_raw.strip().split(":")
-            if len(_parts) >= 4:
-                _ip, _port, _puser, _ppwd = _parts[0], _parts[1], _parts[2], _parts[3]
-                _proxy_task_data = {
-                    "proxyType": "http",
-                    "proxyAddress": _ip,
-                    "proxyPort": int(_port),
-                    "proxyLogin": _puser,
-                    "proxyPassword": _ppwd,
-                }
-                logger.info(f"[Captcha] 🔗 Proxy IP Match ativo: {_ip}:{_port}")
+            _parsed_proxy = _parse_proxy_raw(proxy_raw)
+            if _parsed_proxy:
+                _ip, _port, _puser, _ppwd = _parsed_proxy
+                _is_literal_ipv4 = bool(
+                    re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", _ip)
+                    and all(0 <= int(octet) <= 255 for octet in _ip.split("."))
+                )
+                if not _is_literal_ipv4 and _cfg_bool("captcha_require_static_proxy_ip", True):
+                    raise RuntimeError(
+                        "Proxy CAPTCHA/browser IP match requires a static proxy IP; "
+                        f"got rotating/superproxy host {_ip}:{_port}. "
+                        "Use webshare_mode='direct' with webshare_fetch_method='api', "
+                        "or disable captcha_require_static_proxy_ip only for diagnostics."
+                    )
+                if _is_literal_ipv4:
+                    _captcha_proxy_type = "http"
+                    try:
+                        _configured_scheme = str(
+                            (scraper_settings or {}).get("proxy_scheme") or "http"
+                        ).strip().lower()
+                        if _configured_scheme in ("socks5", "socks5h"):
+                            _captcha_proxy_type = "socks5"
+                    except Exception:
+                        pass
+                    _proxy_task_data = {
+                        "proxyType": _captcha_proxy_type,
+                        "proxyAddress": _ip,
+                        "proxyPort": int(_port),
+                        "proxyLogin": _puser,
+                        "proxyPassword": _ppwd,
+                    }
+                    logger.info(f"[Captcha] 🔗 Proxy IP Match ativo: {_ip}:{_port}")
+                else:
+                    logger.info(
+                        f"[Captcha] Proxy {_ip}:{_port} e hostname/superproxy; "
+                        "providers como Anti-Captcha exigem IP literal. "
+                        "A task CAPTCHA sera enviada em modo proxyless."
+                    )
         except Exception as _pe:
             logger.warning(f"[Captcha] Nao foi possivel preparar proxy para CAPTCHA: {_pe}")
     # =======================================================================
@@ -3709,11 +3946,16 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             task_id = task_resp.get("taskId")
             if not task_id:
                 _captcha_record(provider, False, _time.time() - t_start)
+                logger.warning(
+                    f"[Captcha] {provider} createTask sem taskId: "
+                    f"{str(task_resp)[:240]}"
+                )
                 return None
 
             # Polling (~90s max); intervalo menor = token mais cedo quando pronto
             _poll = _cfg_float("captcha_poll_interval_sec", 1.5)
             _max_polls = _cfg_int("captcha_max_poll_iterations", 60)
+            _poll_error_logged = False
             for _ in range(_max_polls):
                 if cancel_event and cancel_event.is_set():
                     return None
@@ -3740,6 +3982,13 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                         result = client.post(result_url, json={
                             "clientKey": api_key, "taskId": task_id
                         }).json()
+                    if result.get("errorId") and not _poll_error_logged:
+                        _poll_error_logged = True
+                        logger.warning(
+                            f"[Captcha] {provider} getTaskResult erro: "
+                            f"{str(result)[:240]}"
+                        )
+                        return None
                     if result.get("status") == "ready":
                         token = result.get("solution", {}).get("gRecaptchaResponse")
                         if validate_token(token):
@@ -3758,7 +4007,7 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
         except Exception as e:
             _captcha_record(provider, False, _time.time() - t_start)
             captcha_router.record(provider, False, _time.time() - t_start)
-            logger.debug(f"[Captcha] {provider} erro: {e}")
+            logger.warning(f"[Captcha] {provider} erro: {str(e)[:220]}")
             return None
 
     # ─── FASE 1: DUAL-SERVICE em paralelo (Anti-Captcha + 2Captcha) ─────────────
@@ -7600,12 +7849,9 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
     if _is_direct_proxy(proxy_raw):
         proxy_config = None
     else:
-        ip, port, proxy_user, proxy_pwd = proxy_raw.split(":")
-        proxy_config = {
-            "server": f"http://{ip}:{port}",
-            "username": proxy_user,
-            "password": proxy_pwd,
-        }
+        proxy_config = _proxy_to_playwright_config(proxy_raw)
+        if not proxy_config:
+            raise RuntimeError(f"[Playwright] Formato de proxy invalido: {proxy_raw}")
 
     _cdp_endpoint = ""
     if scraper_settings:
@@ -7695,6 +7941,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
     browser    = None
     context    = None
     page       = None
+    _tls_client = None
     pool_entry_registered = False
     pool_should_invalidate = False
 
@@ -7759,6 +8006,12 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     f"[TLSClient] Preflight: status={tls_result['status']} "
                     f"cookies={list(tls_result['cookies'].keys())}"
                 )
+                if int(tls_result.get("status") or 0) >= 500:
+                    raise RuntimeError(
+                        "MNE devolveu página de manutenção/indisponibilidade no preflight TLS. "
+                        f"URL: {BASE_URL}/VistosOnline/ | status={tls_result.get('status')} | "
+                        f"text={_short_normalized_text(tls_result.get('text') or '')!r}"
+                    )
                 if not _cfg_bool("tls_preflight_inject_cookies", False):
                     _tls_client._cookies = {}
                     logger.info(
@@ -7795,6 +8048,25 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     '--disable-dev-shm-usage',
                 ]
 
+                # Cheap probe before launching Chrome. If MNE already returns
+                # maintenance/503 for this proxy exit, rotate without paying the
+                # cost of browser startup, screenshots, and context setup.
+                _tls_client = TLSClient(
+                    user_agent=user_agent,
+                    proxy_raw=None if _is_direct_proxy(proxy_raw) else proxy_raw,
+                )
+                tls_result = await _tls_client.preflight_tls(f"{BASE_URL}/VistosOnline/")
+                logger.info(
+                    f"[TLSClient] Preflight: status={tls_result['status']} "
+                    f"cookies={list(tls_result['cookies'].keys())}"
+                )
+                if int(tls_result.get("status") or 0) >= 500:
+                    raise RuntimeError(
+                        "MNE devolveu página de manutenção/indisponibilidade no preflight TLS. "
+                        f"URL: {BASE_URL}/VistosOnline/ | status={tls_result.get('status')} | "
+                        f"text={_short_normalized_text(tls_result.get('text') or '')!r}"
+                    )
+
                 logger.info("[Playwright] Launching REAL Chrome/Edge browser...")
                 channel_to_use = "chrome"
                 try:
@@ -7823,15 +8095,6 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                         raise RuntimeError(f"Nem Chrome nem Edge encontrados. Erro: {final_e}")
 
                 # ── TLS/JA3 PREFLIGHT ────────────────────────────────────────────────
-                _tls_client = TLSClient(
-                    user_agent=user_agent,
-                    proxy_raw=None if _is_direct_proxy(proxy_raw) else proxy_raw,
-                )
-                tls_result = await _tls_client.preflight_tls(f"{BASE_URL}/VistosOnline/")
-                logger.info(
-                    f"[TLSClient] Preflight: status={tls_result['status']} "
-                    f"cookies={list(tls_result['cookies'].keys())}"
-                )
                 if not _cfg_bool("tls_preflight_inject_cookies", False):
                     _tls_client._cookies = {}
                     logger.info(
@@ -8091,7 +8354,16 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             main_page_response = await page.goto(main_page_url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_selector("body", timeout=3000)
             logger.info(f"[Playwright] Main page loaded (status: {main_page_response.status if main_page_response else 'N/A'})")
+            _main_unavailable, _main_title, _main_text = await _page_service_unavailable_snapshot(page)
+            if (main_page_response and main_page_response.status >= 500) or _main_unavailable:
+                raise RuntimeError(
+                    "MNE devolveu página de manutenção/indisponibilidade ao abrir a página inicial. "
+                    f"URL: {page.url} | status={main_page_response.status if main_page_response else 'N/A'} | "
+                    f"title={_main_title[:80]!r} | text={_short_normalized_text(_main_text)!r}"
+                )
         except Exception as main_page_error:
+            if _is_site_unavailable_error(main_page_error):
+                raise
             logger.warning(f"[Playwright] Main page visit failed (non-critical): {main_page_error}")
 
         # Aceitar cookie consent popup se visível
@@ -8184,17 +8456,10 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         else:
             _cp_prewarm = bool(_cp_prewarm)
         if _cp_prewarm:
-            try:
-                _start_captcha_solver(
-                    "[Captcha] 🚀 Prewarm: solver lançado durante a navegação "
-                    "para a página de login."
-                )
-            except Exception as _cp_err:
-                captcha_future = None
-                captcha_start_time = None
-                logger.warning(
-                    f"[Captcha] Prewarm falhou, voltando ao arranque normal: {_cp_err}"
-                )
+            logger.info(
+                "[Captcha] Prewarm configurado, mas login agora inicia CAPTCHA "
+                "somente apos concluir o preenchimento dos campos."
+            )
         
         max_nav_retries = 3
         nav_success = False
@@ -8251,6 +8516,10 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             except Exception as nav_error:
                 last_error = nav_error
                 error_str = str(nav_error).lower()
+                if _is_site_unavailable_error(nav_error):
+                    raise RuntimeError(
+                        f"Navegação falhou: MNE indisponível/manutenção detectado sem retries adicionais: {nav_error}"
+                    ) from nav_error
 
                 # TRATAMENTO DE REDIRECT (Interrompido)
                 if "interrupted" in error_str or "net::err_aborted" in error_str:
@@ -8441,33 +8710,28 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             logger.info(f"[Pipeline] ✅ Form fill concluído em {fill_time:.2f}s")
             return fill_time
 
-        # Lançar CAPTCHA solver em background ANTES de iniciar o gather
-        loop = asyncio.get_running_loop()
+        # Fill login fields first, then start CAPTCHA. Some providers reject
+        # early tasks before the browser has completed the page interaction.
         if quick_widget_check:
-            logger.info("[Pipeline] ✅ CAPTCHA detectado — lançando solver + form fill em paralelo...")
+            logger.info("[Pipeline] ✅ CAPTCHA detectado — preenchendo formulario antes do solver...")
         else:
-            logger.info("[Pipeline] CAPTCHA widget não detectado ainda — lançando pipeline mesmo assim...")
-        if captcha_future is None:
-            _start_captcha_solver()
-        else:
-            logger.info("[Pipeline] CAPTCHA solver já estava em curso desde a navegação para login.")
+            logger.info("[Pipeline] CAPTCHA widget não detectado ainda — preenchendo formulario primeiro...")
 
-        # Wrapper async para o future do executor (compatível com gather)
-        async def _wait_captcha_future():
-            return await captcha_future
-
-        # ── gather: form fill e CAPTCHA solver correm em simultâneo ──────────
+        # ── Fill first; CAPTCHA starts after input is complete ────────────────
         pipeline_start = time_module.time()
-        fill_result, _ = await asyncio.gather(
-            _fill_login_form(),
-            _wait_captcha_future(),
-            return_exceptions=True,
-        )
-        pipeline_elapsed = time_module.time() - pipeline_start
-        logger.info(f"[Pipeline] ✅ Pipeline concluída em {pipeline_elapsed:.2f}s "
-                    f"(fill={'OK' if not isinstance(fill_result, Exception) else fill_result})")
+        try:
+            fill_result = await _fill_login_form()
+        except Exception as fill_exc:
+            logger.error(f"[Pipeline] Form fill falhou antes do CAPTCHA: {fill_exc}")
+            raise
 
-        fill_time = fill_result if isinstance(fill_result, float) else 0.0
+        pipeline_elapsed = time_module.time() - pipeline_start
+        logger.info(
+            f"[Pipeline] ✅ Form fill concluído em {pipeline_elapsed:.2f}s; "
+            "aguardando readiness do reCAPTCHA antes do solver."
+        )
+
+        fill_time = fill_result
         fill_start_time = time_module.time() - fill_time  # compatibilidade com código abaixo
         logger.info(f"[Playwright] Form filling took {fill_time:.2f}s")
 
@@ -8496,8 +8760,6 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             )
             widget_ready = True
             logger.info("[Playwright] ✅ reCAPTCHA widget ready")
-            if captcha_future is None:
-                _start_captcha_solver()
         except Exception:
             logger.warning("[Playwright] wait_for_function timed out — falling back to polling loop...")
 
@@ -8616,10 +8878,6 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                            f"iframe={widget_info.get('iframe_found')}, "
                            f"found={widget_info.get('found')}")
                 
-                if widget_info.get('found') and captcha_future is None:
-                    logger.info("[Playwright] ✅ CAPTCHA widget detected during wait! Starting background CAPTCHA solving now...")
-                    _start_captcha_solver()
-                
                 if widget_info.get('found'):
                     widget_id = widget_info.get('widgetId', 0)
                     logger.info(f"[Playwright] ✅ reCAPTCHA widget detected and ready! "
@@ -8630,9 +8888,6 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 else:
                     if widget_info.get('grecaptcha_loaded') and not widget_info.get('grecaptcha_function'):
                         logger.info("[Playwright] grecaptcha loaded but getResponse not ready yet...")
-                        if captcha_future is None and (widget_info.get('iframe_found') or widget_info.get('details', {}).get('recaptchaDivs', 0) > 0):
-                            logger.info("[Playwright] CAPTCHA widget elements detected, starting background solving...")
-                            _start_captcha_solver()
 
                 if attempt < max_widget_wait_attempts - 1:
                     wait_time = 1500
@@ -10900,14 +11155,30 @@ async def main(username, password, proxy_list, process_id: int = 0):
         
         _rot_cap = max(1, _cfg_int("max_captcha_key_rotations", 2))
         max_login_attempts = min(num_keys, max(1, _rot_cap))
+        mne_unavailable_proxy_retries = max(
+            0,
+            min(20, _cfg_int("mne_unavailable_proxy_retries", 4)),
+        )
+        mne_unavailable_retry_sleep = max(
+            0.5,
+            _cfg_float("mne_unavailable_proxy_retry_sleep_sec", 3.0),
+        )
+        total_login_slots = max_login_attempts + mne_unavailable_proxy_retries
+        captcha_failure_count = 0
+        mne_unavailable_count = 0
         
         new_client = None
         
-        for login_attempt in range(max_login_attempts):
-            # 2. Calcula o índice atual
-            captcha_key_index = (base_captcha_index + login_attempt) % num_keys
+        for login_attempt in range(total_login_slots):
+            # 2. Calcula o índice atual. Falhas de manutenção/503 antes do
+            # formulário não gastam CAPTCHA, por isso não avançam a rotação.
+            captcha_key_index = (base_captcha_index + captcha_failure_count) % num_keys
             
-            logger.info(f"[Login] Attempt {login_attempt + 1}/{max_login_attempts} (Using Key Index {captcha_key_index}, Process ID {process_id})")
+            logger.info(
+                f"[Login] Attempt {login_attempt + 1}/{total_login_slots} "
+                f"(Using Key Index {captcha_key_index}, Process ID {process_id}, "
+                f"mne_503_retries={mne_unavailable_count}/{mne_unavailable_proxy_retries})"
+            )
             
             client = None
             _sess_tries = max(1, min(8, _cfg_int("create_session_max_tries", 2)))
@@ -10935,9 +11206,12 @@ async def main(username, password, proxy_list, process_id: int = 0):
                 
                 if login_result is None:
                     logger.warning(f"Login attempt {login_attempt + 1} returned None. Rotating API key...")
-                    if login_attempt < max_login_attempts - 1:
+                    captcha_failure_count += 1
+                    if captcha_failure_count < max_login_attempts:
                         logger.info("Will retry with next API key index.")
                         await asyncio.sleep(5)
+                    else:
+                        break
                     continue
                 
                 login_response, new_client = login_result
@@ -10986,15 +11260,57 @@ async def main(username, password, proxy_list, process_id: int = 0):
                 )
                 raise
             except Exception as e:
+                if _is_site_unavailable_error(str(e)) and mne_unavailable_count < mne_unavailable_proxy_retries:
+                    mne_unavailable_count += 1
+                    _current_proxy = None
+                    if proxy_lease_manager:
+                        try:
+                            _current_proxy = proxy_lease_manager.current_proxy_of(username)
+                        except Exception as _cp_err:
+                            logger.warning(
+                                f"[main] {username}: falha ao ler proxy actual "
+                                f"apos MNE 503: {_cp_err}"
+                            )
+                    _current_proxy = _current_proxy or proxy_raw
+                    if proxy_lease_manager and _current_proxy and not _is_direct_proxy(_current_proxy):
+                        try:
+                            proxy_lease_manager.ban_proxy(
+                                _current_proxy,
+                                reason="site_unavailable",
+                            )
+                            proxy_lease_manager.release(username)
+                        except Exception as _rot_err:
+                            logger.warning(
+                                f"[main] {username}: falha ao libertar/soft-ban "
+                                f"proxy apos MNE 503: {_rot_err}"
+                            )
+                    try:
+                        if client is not None:
+                            client.close()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[main] {username}: MNE devolveu 503/manutencao via "
+                        f"{_proxy_safe_label(_current_proxy)}; tentando outro proxy "
+                        f"({mne_unavailable_count}/{mne_unavailable_proxy_retries}) "
+                        f"apos {mne_unavailable_retry_sleep:.1f}s."
+                    )
+                    await asyncio.sleep(mne_unavailable_retry_sleep)
+                    continue
                 if _login_fatal_skip_captcha_key_rotate(str(e)):
                     raise
+                captcha_failure_count += 1
                 logger.exception(f"Login attempt {login_attempt + 1} failed with error: {e}")
-                if login_attempt < max_login_attempts - 1:
+                if captcha_failure_count < max_login_attempts:
                     logger.info("Will retry with next API key index.")
                     await asyncio.sleep(5)
+                else:
+                    break
         else:
             logger.error("Login failed after trying all available API keys. Marking as failed.")
             return False
+        logger.error("Login failed after trying configured login/proxy attempts. Marking as failed.")
+        return False
     except (PostLoginFailure, CaptchaTokenExpired, LoginPostSubmittedFailure):
         raise
     except Exception as e:
@@ -11344,6 +11660,12 @@ def worker(proxy_chunk: List[str], process_id: int,
             df_seed['status'] = (
                 df_seed['status'].astype(str).str.strip().str.lower()
             )
+            reclaimed = _reclaim_stale_processing_rows(df_seed, credentials_file_path)
+            if reclaimed:
+                logger.info(
+                    f"[Process-{process_id}] Sem Redis: {reclaimed} linha(s) "
+                    "'processing' recuperadas antes de preencher fila local."
+                )
             seeded = work_queue.push_users(df_seed.to_dict('records'))
             logger.info(
                 f"[Process-{process_id}] Sem Redis: {seeded} utilizadores pendentes "
@@ -11699,6 +12021,13 @@ def worker(proxy_chunk: List[str], process_id: int,
 
                     final_status = 'false'
 
+                if final_status == 'false' and attempt >= max_user_attempts - 1:
+                    final_status = 'failed_retry_later'
+                    logger.warning(
+                        f"[Process-{process_id}] {username}: max_user_attempts esgotado; "
+                        "marcando failed_retry_later para nao re-enfileirar no mesmo run."
+                    )
+
                 if attempt < max_user_attempts - 1:
                     await asyncio.sleep(5)
         except asyncio.CancelledError:
@@ -11929,8 +12258,12 @@ def fetch_webshare_proxy_list(settings: Dict, api_key: str) -> List[str]:
     except (TypeError, ValueError):
         max_proxies = 0
 
+    plan_id = str(settings.get("webshare_plan_id", "") or "").strip()
     timeout = float(settings.get("webshare_api_timeout_sec", 20) or 20)
     country_codes = str(settings.get("webshare_country_codes", "") or "").strip()
+    backbone_port = str(settings.get("webshare_backbone_port", "80") or "80").strip()
+    if not backbone_port.isdigit():
+        backbone_port = "80"
     excluded_country_codes = {
         code.strip().upper()
         for code in str(settings.get("webshare_excluded_country_codes", "") or "").split(",")
@@ -11958,10 +12291,13 @@ def fetch_webshare_proxy_list(settings: Dict, api_key: str) -> List[str]:
 
     headers = {"Authorization": f"Token {api_key}"}
     params = {"mode": mode, "page": 1, "page_size": page_size}
+    if plan_id:
+        params["plan_id"] = plan_id
     if country_codes and country_codes not in ("-", "*", "all"):
         params["country_code__in"] = country_codes
 
     proxies: List[str] = []
+    residential_backbone_fallbacks = 0
     base_url = "https://proxy.webshare.io/api/v2/proxy/list/"
 
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
@@ -11981,6 +12317,15 @@ def fetch_webshare_proxy_list(settings: Dict, api_key: str) -> List[str]:
                 port = str(item.get("port") or "").strip()
                 username = str(item.get("username") or "").strip()
                 password = str(item.get("password") or "").strip()
+                if mode == "backbone":
+                    host = "p.webshare.io"
+                    port = backbone_port
+                elif not host and username and password:
+                    # Residential pool filters do not expose direct IPs in the API.
+                    # Webshare documents these as Backbone-only via p.webshare.io.
+                    host = "p.webshare.io"
+                    port = backbone_port
+                    residential_backbone_fallbacks += 1
                 if host and port and username and password:
                     proxies.append(f"{host}:{port}:{username}:{password}")
                 if max_proxies and len(proxies) >= max_proxies:
@@ -11995,11 +12340,28 @@ def fetch_webshare_proxy_list(settings: Dict, api_key: str) -> List[str]:
     if not proxies:
         raise ValueError("Webshare API retornou 0 proxies validos.")
 
+    random.shuffle(proxies)
+    country_counts: Dict[str, int] = {}
+    for proxy_line in proxies:
+        country = _webshare_country_from_proxy_line(proxy_line) or "??"
+        country_counts[country] = country_counts.get(country, 0) + 1
+    country_summary = ",".join(
+        f"{country}:{count}"
+        for country, count in sorted(country_counts.items())
+    )
     logger.info(
         f"[Webshare] Loaded {len(proxies)} proxies via API "
         f"(mode={mode}, countries={country_codes or 'all'}, "
-        f"excluded={','.join(sorted(excluded_country_codes)) or 'none'})."
+        f"excluded={','.join(sorted(excluded_country_codes)) or 'none'}, "
+        f"loaded_countries={country_summary or 'unknown'})."
     )
+    if residential_backbone_fallbacks:
+        logger.warning(
+            f"[Webshare] {residential_backbone_fallbacks} residential API item(s) "
+            "sem proxy_address directo foram carregados via p.webshare.io "
+            f"(backbone_port={backbone_port}). Direct mode nao fornece IP fixo "
+            "para residential pool_filter."
+        )
     return proxies
 
 
@@ -12142,6 +12504,235 @@ def _webshare_country_from_proxy_line(proxy_line: str) -> Optional[str]:
         return None
 
 
+def _soax_slug(value: str) -> str:
+    """Normalize SOAX username parameters without touching already URL-safe text."""
+    value = str(value or "").strip().lower()
+    value = re.sub(r"\s+", "+", value)
+    return re.sub(r"[^a-z0-9+_.%-]+", "", value)
+
+
+def _verify_soax_geo_api(settings: Dict, package_key: str, country: str) -> None:
+    """Best-effort SOAX API check for the selected country/connection type."""
+    api_key = str(
+        settings.get("soax_api_key")
+        or os.environ.get("SOAX_API_KEY")
+        or ""
+    ).strip()
+    if not api_key or not country:
+        return
+
+    conn_type = str(settings.get("soax_conn_type", "wifi") or "wifi").strip().lower()
+    if conn_type not in ("wifi", "mobile"):
+        conn_type = "wifi"
+
+    try:
+        response = httpx.get(
+            "https://api.soax.com/api/get-country-regions",
+            params={
+                "api_key": api_key,
+                "package_key": package_key,
+                "country_iso": country,
+                "conn_type": conn_type,
+            },
+            timeout=float(settings.get("soax_api_timeout_sec", 15) or 15),
+        )
+        response.raise_for_status()
+        regions = response.json()
+        region_count = len(regions) if isinstance(regions, list) else 0
+        logger.info(
+            f"[SOAX API] Geo OK: country={country}, conn_type={conn_type}, "
+            f"regions={region_count}."
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[SOAX API] Geo check failed for country={country}, conn_type={conn_type}: "
+            f"{str(exc)[:160]}"
+        )
+
+
+def fetch_soax_proxy_list(settings: Dict) -> List[str]:
+    """
+    Build SOAX proxy entries in the bot's host:port:username:password format.
+
+    SOAX access is through proxy.soax.com:5000 with targeting encoded in the
+    username, so there is no downloadable proxy list like Webshare.
+    """
+    host = str(settings.get("soax_host", "proxy.soax.com") or "proxy.soax.com").strip()
+    port = str(settings.get("soax_port", "5000") or "5000").strip()
+    exact_username = str(settings.get("soax_username", "") or "").strip()
+    package_id = str(settings.get("soax_package_id", "") or "").strip()
+    password = str(
+        settings.get("soax_password")
+        or settings.get("soax_package_key")
+        or os.environ.get("SOAX_PASSWORD")
+        or os.environ.get("SOAX_PACKAGE_KEY")
+        or ""
+    ).strip()
+    if not host or not port or not password or (not exact_username and not package_id):
+        raise ValueError(
+            "proxy_source=soax requer soax_username ou soax_package_id, alem de "
+            "soax_password, soax_host e soax_port."
+        )
+
+    base_username = exact_username or f"package-{package_id}"
+    country = _soax_slug(settings.get("soax_country_iso", ""))
+    region = _soax_slug(settings.get("soax_region", ""))
+    city = _soax_slug(settings.get("soax_city", ""))
+    isp = _soax_slug(settings.get("soax_isp", ""))
+    _verify_soax_geo_api(settings, password, country)
+    if exact_username:
+        sticky = "sessionid-" in exact_username
+        session_length_match = re.search(r"-sessionlength-(\d+)", exact_username)
+        session_length = int(session_length_match.group(1)) if session_length_match else 0
+        proxies = [f"{host}:{port}:{exact_username}:{password}"]
+        logger.info(
+            f"[SOAX] Loaded 1 exact proxy session "
+            f"(host={host}:{port}, package={package_id or 'from_username'}, "
+            f"sticky={sticky}, length={session_length or 'default'}s)."
+        )
+        return proxies
+
+    if country:
+        base_username += f"-country-{country}"
+    if region:
+        base_username += f"-region-{region}"
+    if city:
+        base_username += f"-city-{city}"
+    if isp:
+        base_username += f"-isp-{isp}"
+
+    try:
+        count = int(settings.get("soax_session_count", 1) or 1)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(count, 500))
+
+    try:
+        session_length = int(settings.get("soax_session_length_sec", 300) or 300)
+    except (TypeError, ValueError):
+        session_length = 300
+    session_length = max(10, min(session_length, 3600))
+
+    sticky = _coerce_bool(settings.get("soax_sticky_sessions", True), True)
+    session_prefix = _soax_slug(settings.get("soax_session_prefix", "visa"))
+    if not session_prefix:
+        session_prefix = "visa"
+
+    proxies: List[str] = []
+    for idx in range(1, count + 1):
+        username = base_username
+        if sticky:
+            username += f"-sessionid-{session_prefix}{idx}-sessionlength-{session_length}"
+        proxies.append(f"{host}:{port}:{username}:{password}")
+
+    logger.info(
+        f"[SOAX] Loaded {len(proxies)} proxy session(s) "
+        f"(host={host}:{port}, package={package_id}, "
+        f"country={country or 'random'}, sticky={sticky}, length={session_length}s)."
+    )
+    return proxies
+
+
+def precheck_mne_reachable_proxies(proxy_list: List[str], settings: Dict) -> List[str]:
+    """
+    Probe a bounded proxy sample against MNE before claiming users.
+
+    If Webshare returns valid proxies but MNE serves the same 503 maintenance page
+    for every sampled exit, continuing would only burn time and user attempts.
+    """
+    if not proxy_list or proxy_list == [DIRECT_PROXY_MARKER]:
+        return proxy_list
+    if not _coerce_bool(settings.get("mne_proxy_precheck_enabled", True), True):
+        return proxy_list
+
+    try:
+        max_checks = int(settings.get("mne_proxy_precheck_max", 12) or 12)
+    except (TypeError, ValueError):
+        max_checks = 12
+    max_checks = max(1, min(max_checks, len(proxy_list)))
+
+    try:
+        timeout = float(settings.get("mne_proxy_precheck_timeout_sec", 12) or 12)
+    except (TypeError, ValueError):
+        timeout = 12.0
+    timeout = max(3.0, min(timeout, 30.0))
+
+    candidates = list(proxy_list)
+    random.shuffle(candidates)
+    sampled = candidates[:max_checks]
+    reachable: List[str] = []
+    blocked: List[str] = []
+
+    logger.info(
+        f"[MNE Precheck] Testing {len(sampled)}/{len(proxy_list)} proxy exits "
+        "against /VistosOnline before claiming users."
+    )
+    for proxy_raw in sampled:
+        proxy_url = _proxy_to_http_url(proxy_raw)
+        if not proxy_url:
+            continue
+        label = _proxy_safe_label(proxy_raw)
+        exit_ip = "unknown"
+        try:
+            try:
+                ip_resp = curl_requests.get(
+                    "https://api.ipify.org?format=json",
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    impersonate="chrome120",
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                if ip_resp.status_code == 200:
+                    exit_ip = str((ip_resp.json() or {}).get("ip") or "unknown")
+            except Exception:
+                pass
+
+            resp = curl_requests.get(
+                f"{BASE_URL}/VistosOnline/",
+                proxies={"http": proxy_url, "https": proxy_url},
+                impersonate="chrome124",
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            text = str(resp.text or "")
+            if resp.status_code < 500 and not _is_mne_service_unavailable_text(text):
+                reachable.append(proxy_raw)
+                logger.info(
+                    f"[MNE Precheck] ✅ {label} exit_ip={exit_ip} "
+                    f"status={resp.status_code}"
+                )
+            else:
+                blocked.append(f"{label}@{exit_ip}:{resp.status_code}")
+                logger.warning(
+                    f"[MNE Precheck] ❌ {label} exit_ip={exit_ip} "
+                    f"status={resp.status_code} (maintenance/blocked)"
+                )
+        except Exception as exc:
+            if _is_proxy_provider_quota_error(str(exc)):
+                raise ValueError(
+                    "[MNE Precheck] Proxy provider devolveu 402/quota antes de chegar ao MNE. "
+                    "A bandwidth/allowance do Webshare parece esgotada ou o plano ainda nao permite tunnel. "
+                    f"Primeiro proxy afectado: {label}@{exit_ip}. Reponha bandwidth e tente novamente."
+                ) from exc
+            blocked.append(f"{label}@{exit_ip}:ERR")
+            logger.warning(
+                f"[MNE Precheck] ❌ {label} exit_ip={exit_ip} erro={str(exc)[:140]}"
+            )
+
+    if reachable:
+        logger.info(
+            f"[MNE Precheck] {len(reachable)} proxy(s) reached MNE; "
+            "using only those for this run."
+        )
+        return reachable
+
+    raise ValueError(
+        "[MNE Precheck] Nenhum proxy testado conseguiu abrir /VistosOnline sem 503. "
+        f"Amostra bloqueada/indisponivel: {', '.join(blocked[:8])}. "
+        "Troque/substitua a pool Webshare por exits que MNE aceite antes de rodar users."
+    )
+
+
 def validate_files_and_config(working_dir: str, scraper_settings: Dict) -> tuple:
     """Validate all required files exist and load data."""
     import pandas as pd
@@ -12173,9 +12764,11 @@ def validate_files_and_config(working_dir: str, scraper_settings: Dict) -> tuple
             or os.environ.get("WEBSHARE_API_KEY")
             or ""
         ).strip()
-        use_webshare = proxy_source in ("webshare_api", "webshare", "auto") or bool(webshare_key)
+        use_webshare = bool(webshare_key) and proxy_source in ("webshare_api", "webshare", "auto")
 
-        if use_webshare and webshare_key:
+        if proxy_source in ("soax", "soax_api"):
+            proxy_list = fetch_soax_proxy_list(scraper_settings)
+        elif use_webshare and webshare_key:
             try:
                 proxy_list = fetch_webshare_proxy_list(scraper_settings, webshare_key)
             except Exception as e:
@@ -12219,6 +12812,7 @@ def validate_files_and_config(working_dir: str, scraper_settings: Dict) -> tuple
             )
 
         proxy_list = [p for p in proxy_list if p]
+        proxy_list = precheck_mne_reachable_proxies(proxy_list, scraper_settings)
         logger.info(f"LOADED {len(proxy_list)} VALID PROXIES.")
 
 
@@ -12271,6 +12865,7 @@ def main_execution_continuous():
             scraper_settings = tomllib.load(f)
         logger = setup_logging(settings=scraper_settings)
         logger.info(f"Iniciando Scraper com Dynamic Work Queue em: {WORKING_DIR}")
+        _cleanup_orphaned_bot_processes(scraper_settings)
         _cleanup_orphaned_playwright_browsers(scraper_settings)
 
         # ── Carregar proxies e CSV ────────────────────────────────────────────
@@ -12518,10 +13113,45 @@ def main_execution_continuous():
                             redis_client=_r_init,
                             reset_status="false",
                         )
+            elif shutdown_interrupted:
+                try:
+                    import pandas as pd
+                    df_cleanup = pd.read_csv(credentials_file, encoding="utf-8")
+                    reclaimed = _reclaim_stale_processing_rows(df_cleanup, credentials_file)
+                    if reclaimed:
+                        logger.info(
+                            f"[Shutdown] Recuperadas {reclaimed} linha(s) processing "
+                            "apos interrupcao sem Redis."
+                        )
+                except Exception as csv_cleanup_err:
+                    logger.warning(
+                        f"[Shutdown] Falha a limpar CSV apos interrupcao sem Redis: "
+                        f"{csv_cleanup_err}"
+                    )
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 executor.shutdown(wait=False)
+            try:
+                cleaned = _cleanup_orphaned_playwright_browsers(scraper_settings)
+                if cleaned:
+                    logger.info(
+                        f"[Shutdown] Playwright browsers orfaos removidos={cleaned}."
+                    )
+            except Exception as browser_cleanup_err:
+                logger.warning(
+                    f"[Shutdown] Falha a limpar browsers Playwright: {browser_cleanup_err}"
+                )
+            try:
+                cleaned_bots = _cleanup_orphaned_bot_processes(scraper_settings)
+                if cleaned_bots:
+                    logger.info(
+                        f"[Shutdown] Bot workers orfaos removidos={cleaned_bots}."
+                    )
+            except Exception as bot_cleanup_err:
+                logger.warning(
+                    f"[Shutdown] Falha a limpar workers Python orfaos: {bot_cleanup_err}"
+                )
     except Exception as e:
         logger.critical(f"🚨 Excecao critica: {e}", exc_info=True)
         return 1

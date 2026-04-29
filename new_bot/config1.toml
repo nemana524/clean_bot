@@ -34,7 +34,7 @@ captcha_max_token_age_seconds = 110
 # true = começa a resolver o CAPTCHA enquanto a Authentication.jsp ainda está
 # a navegar/carregar. Reduz o tempo morto entre o preenchimento dos campos e
 # o aparecimento do check do reCAPTCHA.
-captcha_prewarm_on_login_navigation = true
+captcha_prewarm_on_login_navigation = false
 
 anti_captcha_api_key = [
   "4b3f3ddf9569d07d3e66c47faa76f84b",
@@ -63,30 +63,58 @@ SITE_KEY = '6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4'
 use_proxy = true
 # Necessário quando use_proxy=false para permitir saída pelo IP local.
 allow_direct_traffic = false
-use_proxy_api = false
-use_dynamic_proxy = false
+use_proxy_api = true
+use_dynamic_proxy = true
 proxy_geo_code = "pt"
 proxy_super_param = true
 proxy_transparency = false
-# "auto" uses Webshare API when webshare_api_key is filled; otherwise it falls back to proxy_file_path.
-proxy_source = "auto"
+# SOAX Residential package integration. SOAX uses one endpoint with targeting
+# encoded in the username: proxy.soax.com:5000:package-...:<password>.
+proxy_source = "soax"
+soax_api_key = "SJfL8IEX_MNVXl1v"
+soax_conn_type = "wifi"
+soax_api_timeout_sec = 15
+soax_host = "proxy.soax.com"
+soax_port = "5000"
+soax_package_id = "335959"
+soax_username = "package-335959-country-pt-sessionid-visaPT001-sessionlength-300"
+soax_password = "ulUve74DtH3Zv2H0"
+soax_country_iso = "pt"
+soax_region = ""
+soax_city = ""
+soax_isp = ""
+soax_sticky_sessions = true
+soax_session_prefix = "visaPT"
+soax_session_count = 1
+soax_session_length_sec = 300
+# Webshare Static Residential/Backbone integration: p.webshare.io:80 + Mylist1234-N usernames.
 webshare_api_key = "u7ym5by4msctxdpx7ol7mienoaynz5hovvq6pzru"
 webshare_mode = "backbone"
-# "download" preserves Webshare dashboard format, including p.webshare.io:80.
-webshare_fetch_method = "download"
-# Optional. Fill only if Webshare requires a specific plan for your account.
-webshare_plan_id = ""
+webshare_fetch_method = "api"
+# Backbone exposes p.webshare.io, but each username maps to an assigned residential IP.
+captcha_require_static_proxy_ip = false
+# Webshare username/password Backbone ports: 80, 1080, 3128, or 9999-19999.
+webshare_backbone_port = "80"
+# Proxy protocol used by curl_cffi/Playwright/CAPTCHA tasks: http or socks5.
+proxy_scheme = "http"
+# Optional. Leave blank when proxy_source=file is used.
+webshare_plan_id = "1301322"
 # Optional. Leave blank; the bot can request a download token with your API key.
 webshare_download_token = ""
-# Empty means all countries available in your Webshare plan.
-webshare_country_codes = ""
-# Optional comma-separated blacklist, for example: "CN,RU,IR"
-webshare_excluded_country_codes = "CN,RU,IR"
+# Rotating residential countries visible in the Webshare list; prioritize nearby/large EU markets.
+webshare_country_codes = "GB,FR,DE,NL,IT,ES,BE,AT,CH,SE,NO,DK,FI,IE,PT,PL,CA"
+# Extra safety blacklist; these are ignored even if accidentally added above.
+webshare_excluded_country_codes = "CN,IR,RU,US,HK,RO,ZA,AR,CL,MX,BR,IN,SG,JP,KR,NZ,AU,VA,SM,MC,AD,LI,GI"
 webshare_page_size = 100
 webshare_max_proxies = 0
 webshare_api_timeout_sec = 20
 webshare_api_fallback_to_file = true
-proxy_file_path = "verified_proxies_alt_test.txt"
+proxy_validation_url = "https://api.ipify.org?format=json"
+proxy_ban_seconds_on_site_unavailable = 300
+mne_proxy_precheck_enabled = true
+mne_proxy_precheck_max = 6
+mne_proxy_precheck_timeout_sec = 12
+proxy_file_path = "verified_proxies_rotating_residential.txt"
 creds_file_path = "creds_alt_test.csv"
 
 # =================================================================================
@@ -127,6 +155,10 @@ login_playwright_retry_max = 1
 max_captcha_key_rotations = 1
 # Tentativas de create_session antes de desistir
 create_session_max_tries = 2
+# Se o MNE devolver 503/manutenção num proxy residencial, tentar outros exits
+# antes de concluir que o site está indisponível para este utilizador.
+mne_unavailable_proxy_retries = 4
+mne_unavailable_proxy_retry_sleep_sec = 3
 # Segundos entre retentativas após rotação de proxy no fluxo Login (none_result)
 login_proxy_retry_sleep_sec = 45
 
@@ -155,7 +187,7 @@ human_delay_scale = 0.55
 # Alinhar com o fluxo manual (ex.: selector "English" no portal). PT também é válido se preferir.
 # O JS do login envia sempre language=PT no POST /login; alinhar a página (?language=) evita inconsistência de sessão.
 language = "PT"
-headless_mode = true
+headless_mode = false
 # Anexar a Chrome/Chromium ja aberto: ex. http://127.0.0.1:9222
 # Ligue com: google-chrome --remote-debugging-port=9222  (ou variavel CDP_ENDPOINT)
 # Com CDP, headless_mode e ignorado; o pool de contextos e desactivado.
