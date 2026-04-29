@@ -4024,9 +4024,30 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
         phase1_providers.append({
             "provider": "2captcha",
             "api_key": twocap_key,
-            "task_type": "RecaptchaV2EnterpriseTask",
+            "task_type": "RecaptchaV2EnterpriseTaskProxyless",
             "create_url": "https://api.2captcha.com/createTask",
             "result_url": "https://api.2captcha.com/getTaskResult",
+        })
+    parallel_login_backups = (
+        _page_action == "login"
+        and not _conservative_login_captcha
+        and _cfg_bool("captcha_parallel_backups_on_login", True)
+    )
+    if parallel_login_backups and capmon_key:
+        phase1_providers.append({
+            "provider": "capmonster",
+            "api_key": capmon_key,
+            "task_type": "RecaptchaV2EnterpriseTaskProxyless",
+            "create_url": "https://api.capmonster.cloud/createTask",
+            "result_url": "https://api.capmonster.cloud/getTaskResult",
+        })
+    if parallel_login_backups and capsolver_key:
+        phase1_providers.append({
+            "provider": "capsolver",
+            "api_key": capsolver_key,
+            "task_type": "ReCaptchaV2EnterpriseTaskProxyless",
+            "create_url": "https://api.capsolver.com/createTask",
+            "result_url": "https://api.capsolver.com/getTaskResult",
         })
 
     # 3.1 — Reordenar pela performance histórica: o melhor provider vai primeiro
@@ -4038,7 +4059,7 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
 
     if phase1_providers:
         n = len(phase1_providers)
-        logger.info(f"[Captcha] Step 1/2: Dual-service ({', '.join(p['provider'] for p in phase1_providers)}) em paralelo...")
+        logger.info(f"[Captcha] Step 1/2: Race ({', '.join(p['provider'] for p in phase1_providers)}) em paralelo...")
         phase1_cancel_event = threading.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=n)
         try:
@@ -4047,7 +4068,11 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                     _solve_single,
                     p["provider"], p["api_key"], p["task_type"],
                     p["create_url"], p["result_url"],
-                    _timeout_primary_s if p["provider"] == "anti-captcha" else _timeout_secondary_s,
+                    (
+                        _timeout_primary_s if p["provider"] == "anti-captcha"
+                        else _timeout_secondary_s if p["provider"] == "2captcha"
+                        else _timeout_fallback_s
+                    ),
                     phase1_cancel_event
                 ): p["provider"]
                 for p in phase1_providers
@@ -4106,6 +4131,14 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                 "login CAPTCHA unresolved by primary providers within safe budget; "
                 "backup solvers skipped to protect remaining MNE reCAPTCHA allowance"
             )
+
+        if parallel_login_backups:
+            logger.warning(
+                "[Captcha] Todos os providers configurados para login paralelo "
+                "falharam/expiraram dentro do orçamento seguro; não há fallback tardio útil."
+            )
+            logger.error(captcha_stats_report())
+            raise Exception("[Captcha] Todos os providers paralelos falharam no login.")
 
     # ─── FASE 2: BACKUP — CapMonster ────────────────────────────────────────────
     if capmon_key:
@@ -9481,6 +9514,163 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         except Exception:
             pass
 
+        async def _wait_for_captcha_completion_state(timeout_ms: int = 12000) -> dict:
+            """Wait for token + browser-visible CAPTCHA completion before submit."""
+            require_visual = _cfg_bool("captcha_require_visual_checkmark_before_submit", True)
+            deadline = time_module.time() + max(1.0, timeout_ms / 1000.0)
+            last_state = {}
+            visual_mark_attempted = False
+
+            async def _frame_checked_state() -> dict:
+                frame_state = {
+                    "frame_checked": False,
+                    "frame_seen": False,
+                    "mark_attempted": visual_mark_attempted,
+                    "mark_ok": False,
+                }
+                for frame in page.frames:
+                    frame_url = str(getattr(frame, "url", "") or "").lower()
+                    if "recaptcha" not in frame_url:
+                        continue
+                    frame_state["frame_seen"] = True
+                    try:
+                        checked = await frame.evaluate("""
+                            () => {
+                                const anchor = document.querySelector('#recaptcha-anchor');
+                                return !!(
+                                    anchor &&
+                                    (
+                                        anchor.getAttribute('aria-checked') === 'true' ||
+                                        anchor.classList.contains('recaptcha-checkbox-checked')
+                                    )
+                                );
+                            }
+                        """)
+                        if checked:
+                            frame_state["frame_checked"] = True
+                            return frame_state
+                    except Exception:
+                        continue
+                return frame_state
+
+            async def _mark_visual_if_possible() -> bool:
+                for frame in page.frames:
+                    frame_url = str(getattr(frame, "url", "") or "").lower()
+                    if "recaptcha" not in frame_url:
+                        continue
+                    try:
+                        marked = await frame.evaluate("""
+                            () => {
+                                const anchor = document.querySelector('#recaptcha-anchor');
+                                if (!anchor) return false;
+                                anchor.setAttribute('aria-checked', 'true');
+                                anchor.classList.remove('recaptcha-checkbox-unchecked');
+                                anchor.classList.add('recaptcha-checkbox-checked');
+                                const border = anchor.querySelector('.recaptcha-checkbox-border');
+                                if (border) {
+                                    border.classList.remove('recaptcha-checkbox-border');
+                                    border.classList.add('recaptcha-checkbox-border-checked');
+                                }
+                                const checkmark = anchor.querySelector('.recaptcha-checkbox-checkmark');
+                                if (checkmark) {
+                                    checkmark.style.display = 'block';
+                                    checkmark.style.opacity = '1';
+                                }
+                                anchor.dispatchEvent(new Event('recaptcha-state-change', { bubbles: true }));
+                                return true;
+                            }
+                        """)
+                        if marked:
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            while time_module.time() < deadline:
+                try:
+                    page_state = await page.evaluate("""
+                        () => {
+                            let token = '';
+                            try {
+                                if (window.grecaptcha?.enterprise?.getResponse) {
+                                    token = window.grecaptcha.enterprise.getResponse() || '';
+                                }
+                            } catch (e) {}
+                            if ((!token || token.length < 100) && window.grecaptcha?.getResponse) {
+                                try {
+                                    token = window.grecaptcha.getResponse(window.captchaWidget || 0) || '';
+                                } catch (e) {}
+                            }
+                            const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
+                            const textareaValue = textarea ? (textarea.value || '') : '';
+                            if ((!token || token.length < 100) && textareaValue) token = textareaValue;
+                            const container = document.querySelector('.g-recaptcha');
+                            const captchaError = document.getElementById('captchaError');
+                            return {
+                                token_length: token ? token.length : 0,
+                                textarea_length: textareaValue.length,
+                                container_checked: !!(
+                                    container &&
+                                    (
+                                        container.classList.contains('recaptcha-checked') ||
+                                        container.getAttribute('data-checked') === 'true'
+                                    )
+                                ),
+                                captcha_error_visible: !!(
+                                    captchaError &&
+                                    captchaError.offsetParent !== null &&
+                                    getComputedStyle(captchaError).display !== 'none'
+                                ),
+                                iframe_count: document.querySelectorAll('iframe[src*="recaptcha"]').length,
+                            };
+                        }
+                    """)
+                    frame_state = await _frame_checked_state()
+                    last_state = {**(page_state or {}), **frame_state}
+                    token_ok = int(last_state.get("token_length") or 0) >= 100
+                    iframe_present = bool(last_state.get("frame_seen") or last_state.get("iframe_count"))
+                    visual_ok = bool(
+                        last_state.get("frame_checked") or
+                        (not iframe_present and last_state.get("container_checked"))
+                    )
+
+                    if token_ok and visual_ok and not last_state.get("captcha_error_visible"):
+                        logger.info(
+                            "[Playwright] ✅ CAPTCHA completion state ready before submit: "
+                            f"token_len={last_state.get('token_length')} "
+                            f"frame_checked={last_state.get('frame_checked')} "
+                            f"container_checked={last_state.get('container_checked')}"
+                        )
+                        return last_state
+
+                    if token_ok and require_visual and not visual_ok and not visual_mark_attempted:
+                        visual_mark_attempted = True
+                        mark_ok = await _mark_visual_if_possible()
+                        last_state["mark_attempted"] = True
+                        last_state["mark_ok"] = mark_ok
+                        logger.info(
+                            "[Playwright] CAPTCHA token ready; attempted visual checkmark sync: "
+                            f"mark_ok={mark_ok}"
+                        )
+
+                    if token_ok and not require_visual and not last_state.get("captcha_error_visible"):
+                        logger.info(
+                            "[Playwright] CAPTCHA token ready; visual checkmark not required by config."
+                        )
+                        return last_state
+                except Exception as state_err:
+                    last_state = {"error": str(state_err)[:200]}
+
+                await page.wait_for_timeout(500)
+
+            raise RuntimeError(
+                "CAPTCHA completion state not ready before submit: "
+                f"{last_state}"
+            )
+
+        captcha_completion_state = await _wait_for_captcha_completion_state()
+        logger.info(f"[Playwright] CAPTCHA completion gate passed: {captcha_completion_state}")
+
         submit_button = page.locator('#NewloginForm-d button#loginFormSubmitButton')
         await submit_button.wait_for(state='visible', timeout=10000)
 
@@ -9566,8 +9756,17 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     if response.status in [301, 302, 303, 307, 308]:
                         location = response.headers.get('location', '')
                         logger.info(f"[Playwright] Login redirect (status {response.status}) to: {location}")
-
-                    login_response_future.set_result(response)
+                        login_response_future.set_result(response)
+                    elif response.status == 403:
+                        login_response_future.set_exception(RuntimeError("HTTP 403 - Proxy/IP Banned"))
+                    else:
+                        # The async response handler below reads the AJAX body before
+                        # resolving the future. Resolving here races it and loses the
+                        # real server JSON, which previously made the bot guess success.
+                        logger.info(
+                            "[Playwright] Login response seen; waiting for AJAX body capture "
+                            "before deciding success/failure."
+                        )
                 except Exception as e:
                     logger.error(f"[Playwright] Error capturing login response: {e}")
             elif '/VistosOnline/login' in url or '/VistosOnline/login' in request_url:
@@ -9823,10 +10022,16 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                         // Check if this is the login request
                         if (options.url && options.url.includes('/VistosOnline/login')) {
                             const originalSuccess = options.success;
+                            const originalError = options.error;
                             options.success = function(data, textStatus, jqXHR) {
                                 try {
                                     // Store the result for later retrieval
                                     let resultObj = null;
+                                    window._lastLoginAjaxSeen = true;
+                                    window._lastLoginAjaxSuccess = true;
+                                    window._lastLoginAjaxStatus = jqXHR ? jqXHR.status : null;
+                                    window._lastLoginAjaxTextStatus = textStatus || '';
+                                    window._lastLoginRaw = (typeof data === 'string') ? data : JSON.stringify(data || null);
                                     if (typeof data === 'string') {
                                         resultObj = JSON.parse(data);
                                     } else if (typeof data === 'object') {
@@ -9842,11 +10047,30 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                                 } catch (e) {
                                     console.warn('[Hook] Failed to parse login AJAX result:', e);
                                 }
-                                
-                                // Call original success callback if it exists
-                                if (originalSuccess) {
-                                    return originalSuccess.apply(this, arguments);
+
+                                // Do NOT call the site's original success callback here.
+                                // That callback immediately calls location.reload(), which
+                                // destroys these captured variables before Playwright can
+                                // inspect the real login result.
+                                window._loginAjaxOriginalSuccessSuppressed = true;
+                                return undefined;
+                            };
+                            options.error = function(jqXHR, textStatus, errorThrown) {
+                                try {
+                                    window._lastLoginAjaxSeen = true;
+                                    window._lastLoginAjaxError = true;
+                                    window._lastLoginAjaxStatus = jqXHR ? jqXHR.status : null;
+                                    window._lastLoginAjaxTextStatus = textStatus || '';
+                                    window._lastLoginAjaxErrorThrown = errorThrown ? String(errorThrown) : '';
+                                    window._lastLoginRaw = jqXHR && jqXHR.responseText ? jqXHR.responseText : '';
+                                    console.warn('[Hook] Login AJAX error intercepted - status:', window._lastLoginAjaxStatus, 'textStatus:', textStatus);
+                                } catch (e) {
+                                    console.warn('[Hook] Failed to capture login AJAX error:', e);
                                 }
+                                // Same as success: avoid site alert/reload side effects until
+                                // Python has recorded the actual error state.
+                                window._loginAjaxOriginalErrorSuppressed = true;
+                                return undefined;
                             };
                         }
                         // Call original ajax
@@ -9982,6 +10206,13 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                             logger.info(f"[Playwright] ✅ Resposta AJAX Capturada: Status {response.status}")
                         except Exception as e:
                             logger.warning(f"[Playwright] Erro ao ler resposta: {e}")
+                            try:
+                                page._login_result = None
+                                page._login_body_read_error = str(e)
+                            except Exception:
+                                pass
+                            if not login_response_future.done():
+                                login_response_future.set_result(response)
             except Exception:
                 pass
 
@@ -10069,6 +10300,69 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             except Exception as _body_err:
                 logger.warning(f"[Playwright] Nao foi possivel ler body da resposta: {_body_err}")
 
+            if result_data is None:
+                captured_result = getattr(page, "_login_result", None)
+                if captured_result:
+                    result_data = captured_result
+                    logger.info(f"[Playwright] 📋 Resposta AJAX recuperada do handler: {result_data}")
+
+            if result_data is None:
+                ajax_state = {}
+                for ajax_wait in range(24):
+                    try:
+                        ajax_state = await page.evaluate("""
+                            () => {
+                                const raw = window._lastLoginRaw || '';
+                                let parsed = window._lastLoginResult || null;
+                                if (!parsed && raw) {
+                                    try { parsed = JSON.parse(raw); } catch (e) {}
+                                }
+                                return {
+                                    seen: !!window._lastLoginAjaxSeen,
+                                    error: !!window._lastLoginAjaxError,
+                                    status: window._lastLoginAjaxStatus || null,
+                                    textStatus: window._lastLoginAjaxTextStatus || '',
+                                    errorThrown: window._lastLoginAjaxErrorThrown || '',
+                                    success: !!window._lastLoginAjaxSuccess,
+                                    suppressedSuccess: !!window._loginAjaxOriginalSuccessSuppressed,
+                                    suppressedError: !!window._loginAjaxOriginalErrorSuppressed,
+                                    result: parsed,
+                                    resultType: window._lastLoginResultType || (parsed && parsed.type) || '',
+                                    resultDesc: window._lastLoginResultDesc || (parsed && parsed.description) || '',
+                                    rawPreview: raw ? raw.slice(0, 800) : '',
+                                    url: window.location.href,
+                                };
+                            }
+                        """)
+                    except Exception:
+                        ajax_state = {}
+
+                    if ajax_state.get("result") or ajax_state.get("error") or ajax_state.get("seen"):
+                        break
+                    await page.wait_for_timeout(500)
+
+                if ajax_state.get("result"):
+                    result_data = ajax_state.get("result")
+                    logger.info(f"[Playwright] 📋 Resposta AJAX capturada via browser hook: {result_data}")
+                elif ajax_state.get("error"):
+                    logger.error(f"[Playwright] ❌ AJAX /login falhou no browser: {ajax_state}")
+                    raise RuntimeError(
+                        "Login AJAX failed in browser: "
+                        f"status={ajax_state.get('status')} "
+                        f"textStatus={ajax_state.get('textStatus')} "
+                        f"error={ajax_state.get('errorThrown')}"
+                    )
+                elif ajax_state.get("seen"):
+                    raw_preview = ajax_state.get("rawPreview") or ""
+                    if raw_preview:
+                        result_data = {"raw": raw_preview}
+                        logger.info(
+                            "[Playwright] 📋 AJAX /login visto sem JSON parseável; "
+                            f"raw={raw_preview[:300]}"
+                        )
+                else:
+                    logger.warning(f"[Playwright] AJAX /login não expôs resultado no browser hook: {ajax_state}")
+
             if login_http_status == 429:
                 logger.error(
                     "[Playwright] HTTP 429 no POST /login — limite de tentativas / bloqueio"
@@ -10116,8 +10410,24 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             if result_data and isinstance(result_data, dict):
                 r_type = result_data.get('type', '').lower()
                 r_desc = _normalize_server_text(result_data.get('description', ''))
+                raw_response = _normalize_server_text(str(result_data.get('raw') or ''))
+                if raw_response and (
+                    'NewloginForm-d' in raw_response
+                    or 'Authentication.jsp' in raw_response
+                    or 'Iniciar Sessão' in raw_response
+                    or 'Perdeu a sessão' in raw_response
+                    or 'Session lost' in raw_response
+                ):
+                    logger.error(
+                        "[Playwright] ❌ POST /login devolveu HTML de login/sessão perdida, "
+                        "não é login aceite."
+                    )
+                    await _save_debug_html("login_returned_authentication_html")
+                    raise RuntimeError(
+                        "Login rejected/unknown: /login returned authentication or session-lost HTML"
+                    )
                 
-                if r_type in ['error', 'recaptchaerror', 'secblock', 'warning', 'redirect']:
+                if r_type in ['error', 'recaptchaerror', 'secblock', 'warning', 'redirect', 'rgpderror']:
                     logger.error(
                         f"[Playwright] ❌ SERVIDOR REJEITOU: http={login_http_status} "
                         f"tipo={r_type}, desc={r_desc}"
@@ -10176,8 +10486,24 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 logger.info(f"[Playwright] ✅ Login Aceito! Tipo: {r_type or 'redirect/OK'}")
                 login_post_accepted = True
             else:
-                # result_data é None = body vazio = redirect imediato = login OK
-                logger.info("[Playwright] ✅ Login provavelmente aceito (body vazio = redirect)")
+                current_after_login = ""
+                try:
+                    current_after_login = page.url
+                except Exception:
+                    pass
+                if "Authentication.jsp" in current_after_login:
+                    logger.error(
+                        "[Playwright] ❌ Resultado do login desconhecido: POST /login respondeu, "
+                        "mas nenhum JSON/AJAX foi capturado e a página continua no login."
+                    )
+                    await _save_debug_html("login_unknown_still_authentication")
+                    raise RuntimeError(
+                        "Login outcome unknown: no trustworthy AJAX response and still on Authentication.jsp"
+                    )
+                logger.info(
+                    "[Playwright] ✅ Login aceito por navegação/redirect confirmado "
+                    f"(URL atual={current_after_login or 'unknown'})"
+                )
                 login_post_accepted = True
             
         except asyncio.TimeoutError:

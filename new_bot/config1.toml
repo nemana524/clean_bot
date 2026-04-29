@@ -18,6 +18,9 @@ captcha_timeout_fallback  = 90
 # seguro, NAO cai para CapMonster/CapSolver. Abortamos antes do POST /login
 # para preservar as tentativas restantes do contador ReCaptcha do MNE.
 captcha_skip_backup_providers_on_login = false
+# true = when login backup providers are enabled, start them in the same race
+# instead of waiting until Anti-Captcha has consumed the whole safe token budget.
+captcha_parallel_backups_on_login = true
 
 # Polling do resultado CAPTCHA (antes: 3s fixo; mais baixo = resposta mais rápida quando pronto)
 captcha_poll_interval_sec = 1.5
@@ -35,6 +38,9 @@ captcha_max_token_age_seconds = 110
 # a navegar/carregar. Reduz o tempo morto entre o preenchimento dos campos e
 # o aparecimento do check do reCAPTCHA.
 captcha_prewarm_on_login_navigation = false
+# true = after token injection, wait until browser/page state shows CAPTCHA
+# completed before clicking login. Prevents clicking before the visible checkmark/state.
+captcha_require_visual_checkmark_before_submit = true
 
 anti_captcha_api_key = [
   "4b3f3ddf9569d07d3e66c47faa76f84b",
