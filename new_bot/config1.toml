@@ -21,6 +21,18 @@ captcha_skip_backup_providers_on_login = false
 # true = when login backup providers are enabled, start them in the same race
 # instead of waiting until Anti-Captcha has consumed the whole safe token budget.
 captcha_parallel_backups_on_login = true
+# SOAX superproxy edges are reachable by the browser, but Anti-Captcha/2Captcha/
+# CapSolver workers have repeatedly returned ERROR_PROXY_CONNECT_REFUSED against
+# the resolved edge IPs. Keep them out of login races when CapMonster is present.
+captcha_skip_soax_custom_proxy_solvers_on_login = true
+# Se true no login SOAX: tentar primeiro CapMonster com proxyAddress igual ao browser antes do proxyless
+# (melhor alinhamento IP token↔POST /login). Se createTask/connect falhar, cai para proxyless.
+captcha_soax_try_capmonster_proxy_match_first = true
+# Fase 0a: evitar timeout prematuro quando CapMonster demora (~40–55s); reduz fallback 0b e avisos «sem tempo restante».
+captcha_soax_capmonster_proxy_attempt_timeout_sec = 50
+# Se o ipify pré-sessão reportou egress IPv4, tentar esse IP como gateway proxy no solver
+# antes do primeiro A-record DNS do host SOAX (fila Fase 0a → Fase 0b).
+captcha_soax_try_validator_egress_as_proxy_gateway = true
 
 # Polling do resultado CAPTCHA (antes: 3s fixo; mais baixo = resposta mais rápida quando pronto)
 captcha_poll_interval_sec = 1.5
@@ -32,12 +44,10 @@ captcha_max_poll_iterations = 60
 # (não gastamos POST /login com um token DOA que devolveria
 # "Foi encontrado um erro ao executar a operação." e penalizaria o proxy
 # como se fosse um servidor a rejeitar).
-captcha_max_token_age_seconds = 110
+captcha_max_token_age_seconds = 100
 
-# true = começa a resolver o CAPTCHA enquanto a Authentication.jsp ainda está
-# a navegar/carregar. Reduz o tempo morto entre o preenchimento dos campos e
-# o aparecimento do check do reCAPTCHA.
-captcha_prewarm_on_login_navigation = false
+# Resolver CAPTCHA durante a navegação à Authentication.jsp — token efectivamente mais recente ao clicar.
+captcha_prewarm_on_login_navigation = true
 # true = after token injection, wait until browser/page state shows CAPTCHA
 # completed before clicking login. Prevents clicking before the visible checkmark/state.
 captcha_require_visual_checkmark_before_submit = true
@@ -126,7 +136,8 @@ creds_file_path = "creds_alt_test.csv"
 # =================================================================================
 # BOOKING — precisão: alinhar intended_date_of_arrival com slots reais (regra do site)
 # =================================================================================
-consular_post_id = "5084"
+# Posto consular no DOM (/Formulario f0sf1). Para residência IRL o portal expõe 2032 (Dublin), não 5084.
+consular_post_id = "2032"
 nationality_of_country = "CPV"
 country_of_residence = "IRL"
 intended_date_of_arrival = "2026/08/21"
@@ -144,6 +155,12 @@ sniper_keepalive = 90
 # =================================================================================
 # PERFORMANCE + FILA (novo_bot)
 # =================================================================================
+# Redis is optional. Keep false for single-machine/local runs to avoid noisy
+# localhost:6379 warnings; set true only when a Redis service is running.
+redis_enabled = false
+redis_host = "localhost"
+redis_port = 6379
+
 # Menos paralelismo = menos pedidos simultâneos ao mesmo destino (menos risco de 403/WAF).
 # Com 1 proxy no ficheiro: 1 worker evita disputa de lease e chunks vazios.
 max_concurrent_users_per_process = 1
@@ -152,25 +169,70 @@ max_workers = 1
 # Antes: BLPOP/check_interval fixo 10s — reduz latência quando a fila está vazia
 queue_check_interval = 3
 
-# Tentativas por utilizador (baixo = menos martelamento em falhas)
-max_user_attempts = 1
+# Segunda tentativa completa após falha (novo solve / nova sessão) — evita ficar preso num único erro.
+# Com login_full_retry_on_generic_operation_error, cada erro JSON genérico no /login
+# usa um índice de tentativa outer; 3 passagens permite 2 falhas transitórias + 1 última antes de failed_retry_later.
+max_user_attempts = 3
 
 # Retentativas de login (Playwright / rotação de proxy na mesma sessão)
-login_playwright_retry_max = 1
-# Quantas chaves Anti-Captcha diferentes tentar por utilizador (não aumentar agressivamente)
-max_captcha_key_rotations = 1
+login_playwright_retry_max = 2
+# Rotação de chave solver em retrys de login dentro do mesmo user
+max_captcha_key_rotations = 2
 # Tentativas de create_session antes de desistir
-create_session_max_tries = 2
+create_session_max_tries = 3
 # Se o MNE devolver 503/manutenção num proxy residencial, tentar outros exits
 # antes de concluir que o site está indisponível para este utilizador.
 mne_unavailable_proxy_retries = 4
 mne_unavailable_proxy_retry_sleep_sec = 3
+
+# Modo seguro para DDoS/manutenção: antes de reclamar utilizadores, faz um probe
+# barato ao MNE. Se houver falhas repetidas, abre um circuit breaker e pausa o
+# worker para não queimar CAPTCHA, não prender contas em processing e não
+# aumentar carga sobre o site degradado.
+# Implementação: procura primeiro com curl_cffi; falhas típicas de TLS/stack no
+# Windows (OPENSSL_internal etc.) fazem uma segunda tentativa com httpx, para não
+# abrir o circuito por problema local quando o site está acessível.
+ddos_safe_mode = true
+ddos_health_probe_interval_sec = 60
+ddos_health_probe_timeout_sec = 12
+ddos_circuit_breaker_failures = 2
+ddos_circuit_breaker_window_sec = 180
+ddos_circuit_breaker_pause_sec = 900
+
 # Segundos entre retentativas após rotação de proxy no fluxo Login (none_result)
 login_proxy_retry_sleep_sec = 45
+
+# Desligado: segundo POST imediato com o mesmo token correlacionava com escalada `/ch/bd.js` (AntibotDiagnostic).
+login_retry_transient_mne_generic_operation_error = false
+# 0 ⇒ um POST /login por solve; erro genérico não repete mesmo token neste fluxo.
+login_transient_mne_error_retries = 0
+login_transient_mne_error_backoff_sec = 12
+# POST /login pode devolver HTML /ch/bd.js; espera até N segundos pelo JSON no hook AJAX.
+login_challenge_ajax_poll_seconds = 120
+login_challenge_retry_sleep_sec = 30
+# Espera até _USER_CONSENT (PoW path /) antes de ir à página de login; reduz sessões “fraquinhas”.
+login_require_user_consent_before_auth = true
+login_user_consent_wait_sec = 45
+login_cookie_poll_step_sec = 0.25
+# Se true depois do budget: só aborta quando há sessão mas falta PoW cookie (economiza solver).
+login_abort_if_no_user_consent_after_wait = false
+# Permite mais uma tentativa outer em /ch/ antes de desistir (cada uma consome fluxo completo).
+login_max_mne_challenge_retries = 4
+# Após JSON genérico "erro ao executar" no /login, repetir `main()` (nova sessão+solve) antes de failed_retry_later.
+login_full_retry_on_generic_operation_error = true
+# Log estruturado [AntibotDiagnostic] em cada POST /login (paths /ch/, cabeçalhos perímetro, classe do corpo).
+login_antibot_diagnostic_bundle = true
+# ── Relatório de factores de bloqueio/fricção (JSON Lines — ver `blocking_diagnostics_report_path`).
+# Sugestões no payload referem apenas documentação pública (TTL reCAPTCHA, backoff, IP estável); não configurar “evasion”.
+blocking_diagnostics_report = true
+blocking_diagnostics_report_path = "mne_blocking_report.jsonl"
+blocking_diagnostics_log_operational_hints = true
 
 # Pausa global (minutos) após falhas graves — todos os workers esperam (Redis + relógio local por processo)
 # Reduzido (antes: 180/240/90/25) para permitir recuperação em minutos em vez de horas.
 global_throttle_minutes_on_403 = 15
+# 403 apenas no POST /login de retentativa MNE — não assume ban permanente; usa failed_retry_later.
+global_throttle_minutes_on_403_transient_retry = 12
 global_throttle_minutes_on_recaptcha_quota = 20
 global_throttle_minutes_on_blocked_site = 10
 # Após falha classificada como captcha (solver) antes de novas tentativas
@@ -193,7 +255,9 @@ human_delay_scale = 0.55
 # Alinhar com o fluxo manual (ex.: selector "English" no portal). PT também é válido se preferir.
 # O JS do login envia sempre language=PT no POST /login; alinhar a página (?language=) evita inconsistência de sessão.
 language = "PT"
-headless_mode = false
+# playwright = browser automation. http_tls = direct curl_cffi/TLS login POST without Playwright.
+login_engine = "playwright"
+headless_mode = true
 # Anexar a Chrome/Chromium ja aberto: ex. http://127.0.0.1:9222
 # Ligue com: google-chrome --remote-debugging-port=9222  (ou variavel CDP_ENDPOINT)
 # Com CDP, headless_mode e ignorado; o pool de contextos e desactivado.
@@ -207,7 +271,8 @@ second_form_json_file = "second_form_mapping_2.json"
 log_level = "INFO"
 logger_console_level = "INFO"
 logger_file_level = "INFO"
-log_to_file = true
+log_to_file = false
+local_debug_artifacts = false
 
 # false avoids injecting cookies created by curl_cffi into Playwright. This is
 # safer with rotating/backbone proxies because each connection may get a
@@ -220,6 +285,9 @@ browser_error_max_html_chars = 16000
 # false = leave Chrome/jQuery native AJAX headers intact.
 # true is legacy/debug only; forcing stale headers can make MNE reject /login.
 login_post_header_override = false
+
+# Segundos a aguardar a resposta HTTP do POST /login (AJAX) após o clique.
+login_response_wait_seconds = 75
 
 [telegram]
 bot_token = "8650079864:AAHMTeqOx6BPVmFmYNVQciZZzSAEqOvEP3Q"

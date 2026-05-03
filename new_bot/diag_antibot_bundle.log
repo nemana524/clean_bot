@@ -1,0 +1,6 @@
+[Redis] desativado; usando estado local/in-memory.
+[Process-0] ? Iniciado | proxies=1 | [WQ] 1 users pendentes na queue
+[Process-0] [PLM] 0 em uso | 0 banidos (memory)
+[TLSClient] ?? Preflight falhou (nao critico): TLS preflight falhou: Failed to perform, curl: (28) Connection timed out after 15001 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+[PLM] ? BAN(mem) proxy.soax.com:5000:packag...-300 por 15s (motivo=tunnel_fail)
+[PLM] ?? Sem proxies alternativos para gilso111

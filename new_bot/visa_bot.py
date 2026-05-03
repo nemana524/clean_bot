@@ -19,6 +19,7 @@ import colorlog
 import redis
 import socket
 import functools
+import hashlib
 import numpy as np
 from curl_cffi import requests as curl_requests
 if TYPE_CHECKING:
@@ -28,12 +29,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 from bs4 import BeautifulSoup
 from datetime import datetime
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, expect
 from playwright_stealth import Stealth
 import gc
 import pytz
 import threading
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # =================================================================================
 # SCRIPT DE STEALTH AVANÇADO (GHOST MODE DINÂMICO)
@@ -911,12 +912,23 @@ DIRECT_PROXY_MARKER = "__DIRECT__"
 CSV_STATUS_EXCLUDE_FROM_QUEUE = frozenset({
     "true", "success", "processing",
     "blocked_site", "banned_403", "recaptcha_quota",
-    "failed_retry_later",
+    "failed_retry_later", "credential_recovery_required",
 })
+
+# Texto marcador dentro de RuntimeError: 403 coincide com POST /login nº2+ após erro MNE transitório.
+# O worker marca failed_retry_later em vez de banned_403 — não presume banimento persistente da conta/proxy.
+LOGIN_403_MARKER_TRANSIENT_RETRY = "after_transient_login_retry"
 
 
 def _norm_csv_status(val) -> str:
-    return str(val or "").strip().lower()
+    try:
+        if val is None or pd.isna(val):
+            return ""
+    except Exception:
+        if val is None:
+            return ""
+    status = str(val).strip().lower()
+    return "" if status in ("nan", "none", "null") else status
 
 
 def _csv_status_summary(df) -> tuple[dict, int]:
@@ -943,6 +955,71 @@ def _csv_status_summary(df) -> tuple[dict, int]:
 def _is_server_login_rejection(err: str) -> bool:
     """Resposta JSON explícita do /login — retentar outra chave Anti-Captcha só piora a quota."""
     return "Login Rejeitado pelo Site" in err
+
+
+def _server_rejection_requires_credential_recovery(err: str) -> bool:
+    """MNE secblock that tells the operator to recover/reset the account credentials."""
+    el = (err or "").lower()
+    return (
+        "recuperação das credenciais" in el
+        or "recuperacao das credenciais" in el
+    )
+
+
+def _server_rejection_points_to_proxy(err: str) -> bool:
+    """Only generic/network-like MNE rejections should count against the proxy."""
+    if not _is_server_login_rejection(err):
+        return False
+    if _server_rejection_requires_credential_recovery(err):
+        return False
+    el = (err or "").lower()
+    account_or_credential_markers = (
+        "recuperação das credenciais",
+        "recuperacao das credenciais",
+        "credenciais",
+        "password",
+        "senha",
+        "utilizador",
+        "username",
+        "rgpd",
+    )
+    if any(marker in el for marker in account_or_credential_markers):
+        return False
+    generic_or_network_markers = (
+        "foi encontrado um erro ao executar",
+        "session lost",
+        "perdeu a sessão",
+        "authentication.jsp",
+        "empty_response",
+        "timeout",
+    )
+    return any(marker in el for marker in generic_or_network_markers)
+
+
+def _is_outer_retryable_generic_mne_login_json(err: str) -> bool:
+    """
+    Erro servlet típico (HTTP 200, type=error) que às vezes é transitório —
+    permite nova volta completa ao main() com novo solve antes de falha CSV.
+    Não usar quando o texto aponta claramente para credenciais incorrectas.
+    """
+    el = (err or "").lower()
+    if not _is_server_login_rejection(err):
+        return False
+    if "erro ao executar" not in el:
+        return False
+    credential_hard_fail = (
+        "credencial" in el
+        and (
+            "incorre" in el
+            or "inválid" in el
+            or "invalid" in el
+            or "incorrect" in el
+            or "errad" in el
+        )
+    )
+    if credential_hard_fail:
+        return False
+    return True
 
 
 def _reclaim_stale_processing_rows(df, credentials_file: str) -> int:
@@ -1164,6 +1241,567 @@ def _is_mne_service_unavailable_text(text: Optional[str]) -> bool:
     return has_unavailable or has_maintenance
 
 
+def _is_mne_login_antibot_challenge_html(html: Optional[str]) -> bool:
+    """
+    POST /login por vezes devolve HTML minimalista com scripts em /ch/ (ex.: bd.js)
+    em vez do JSON esperado — é desafio WAF/antibot, não aceitação de credenciais.
+    Tratar como sucesso leva a sessão aparente em / mas /Questionario «Perdeu a sessão».
+    """
+    if not html or len(html.strip()) < 40:
+        return False
+    h = html.lower()
+    # Resposta vista em produção: DOCTYPE + meta robots noindex,nofollow + /ch/bd.js
+    if "/ch/bd.js" in h:
+        return True
+    if 'src="/ch/' in h or "src='/ch/" in h:
+        return True
+    if "/ch/v" in h and "<script" in h:
+        return True
+    return False
+
+
+def _mne_redact_header_value(key: str, val: Optional[str]) -> str:
+    lk = str(key).lower()
+    va = "" if val is None else str(val)
+    if not va:
+        return ""
+    if any(s in lk for s in ("cookie", "authorization", "x-api-", "signature")):
+        return f"<redacted chars={len(va)}>"
+    if "referer" in lk:
+        try:
+            u = urlparse(va)
+            return f"<referer host={u.netloc} path={(_short_normalized_text(u.path, 96))}>"
+        except Exception:
+            return "<referer redacted>"
+    if len(va) > 560:
+        return va[:557] + "..."
+    return va
+
+
+def _mne_normalized_response_headers(response) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        hdr = getattr(response, "headers", None) or {}
+        for rk, rv in hdr.items():
+            kl = str(rk).lower()
+            # Playwright já funde cabeçalhos; `set-cookie` pode estar ausente quando escondido
+            out[kl] = _mne_redact_header_value(str(rk), str(rv))
+    except Exception:
+        pass
+    return out
+
+
+def _mne_gather_set_cookie_names_hint(headers_lc: Dict[str, str]) -> str:
+    """
+    Produz string com nomes de cookies `Set-Cookie` (sem valores) quando dedutível dos cabeçalhos Playwright.
+    """
+    chunks: List[str] = []
+    for k, v in headers_lc.items():
+        lk = str(k).lower()
+        if lk.startswith("set-cookie"):
+            chunks.append(str(v).lower())
+    blob = "; ".join(chunks)
+    if not blob:
+        return ""
+    names: List[str] = []
+    for part in blob.split(";"):
+        p = part.strip()
+        if not p or "=" not in p:
+            continue
+        nm = p.split("=", 1)[0].strip()
+        if nm and nm not in names:
+            names.append(nm)
+    return ",".join(names[:72])
+
+
+def _mne_html_challenge_markers(html: Optional[str]) -> Dict[str, Any]:
+    hm: Dict[str, Any] = {
+        "body_chars": len(html or ""),
+        "explicit_bd_js": False,
+        "ch_paths_found": [],
+        "title_guess": "",
+        "robots_meta": "",
+    }
+    if not html:
+        return hm
+    low = html.lower()
+    hm["explicit_bd_js"] = "/ch/bd.js" in low
+    paths = sorted(set(re.findall(r"/ch/[a-z0-9_/.\-]{1,96}", low, flags=re.I)))
+    hm["ch_paths_found"] = paths[:40]
+    m = re.search(r"<title[^>]*>\s*([^<]{1,240})", html, re.I | re.S)
+    hm["title_guess"] = _short_normalized_text((m.group(1) if m else "") or "")
+    mr = re.search(
+        r'<meta[^>]+name\s*=\s*["\'](?:robots|referrer)["\'][^>]+content\s*=\s*["\']([^"\']+)',
+        html,
+        re.I | re.S,
+    )
+    if mr:
+        hm["robots_meta"] = mr.group(1).strip().lower()[:320]
+    return hm
+
+
+def _mne_classify_login_body_antibot(body: Optional[str]) -> Tuple[str, List[str]]:
+    """
+    Classifica o corpo do POST /login do ponto de vista antibot/autorização aplicacional.
+    """
+    hints: List[str] = []
+    if not body or not str(body).strip():
+        return "empty_body", hints
+    s = str(body).strip()
+    if _is_mne_login_antibot_challenge_html(s):
+        hints.append(
+            "Resposta não é JSON de login — é marcação HTML minimalista "
+            "com scripts hospedados no próprio pedidodevistos sob o path `/ch/*` "
+            "(p.ex. bd.js). Isto opera no browser antes/adjacentemente ao JSON de login AJAX."
+        )
+        hints.append(
+            "Não equivale ao JSON `type=error`. É um nível típico de gate anti-abuso/perímetro "
+            "acoplado à app (não mostra apenas credenciais erradas)."
+        )
+        return "perimeter_challenge_html_under_host_ch_star", hints
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            ty = str(obj.get("type") or "").strip().lower()
+            desc_raw = obj.get("description")
+            ds = ""
+            try:
+                ds = _normalize_server_text(desc_raw).lower()
+            except Exception:
+                ds = str(desc_raw or "").lower()
+            if ty == "error":
+                hints.append(
+                    "Resposta é JSON válido gerado pela aplicação VistosOnline (AJAX doLogin / camada servlet), "
+                    "não pelo HTML `/ch/` de gate."
+                )
+                if ds and "recaptcha" in ds:
+                    hints.append("Descrição sugere problema de quota/validação reCAPTCHA cotada pela app.")
+                if "erro ao executar" in ds:
+                    hints.append(
+                        "'Foi encontrado um erro ao executar a operação.' costuma aparecer quando o verify "
+                        "Google/MNE falha ou o token não é aceite como válido nesta sessão (inclui token expirado), "
+                        "não apenas bloqueio de proxy ao nível TLS."
+                    )
+                return "application_json_login_rejection_or_recaptcha_gate", hints
+            if ty in ("warning", "recaptchaerror"):
+                return f"application_json_{ty}_path", hints
+            if ty:
+                hints.append(f"JSON com type={ty!r} na rota `/VistosOnline/login`.")
+                return f"application_json_type_{ty}", hints
+            return "application_json_unknown_shape", hints
+    except json.JSONDecodeError:
+        hints.append(
+            "Corpo não é JSON válido nem reconhecido como desafío `/ch/*` típico; "
+            "pode ser HTML intermédio, redirect marcado ou resposta degradada."
+        )
+        return "non_json_markup_unclassified", hints
+    hints.append("Reclassificação inesperada — ver raw length.")
+    return "body_parse_edge", hints
+
+
+def _mne_infer_network_edge_signals(
+    headers_lc: Dict[str, str],
+    *,
+    raw_set_cookie_joined_lc: str = "",
+) -> Tuple[List[str], List[str]]:
+    """
+    Lista (inferences, raw_evidence_markers).
+
+    Tentativa só com cabeçalhos públicos observáveis pelo browser — não é garantia jurídica,
+    mas permite distinguir perímetro CDN/WAF típicos de erro puramente no servlet.
+    """
+    inf: List[str] = []
+    ev: List[str] = []
+
+    srv = " ".join(
+        headers_lc[k] for k in sorted(headers_lc) if k == "server" or k.startswith("server")
+    ).lower()
+
+    hdr_join = "|".join(f"{k}={headers_lc[k]}" for k in sorted(headers_lc.keys())).lower()
+
+    ck_hint = _mne_gather_set_cookie_names_hint(headers_lc)
+
+    raw_ck = raw_set_cookie_joined_lc or ""
+
+    via = headers_lc.get("via") or ""
+
+    cf_ray = headers_lc.get("cf-ray") or headers_lc.get("cf_ray")
+    if cf_ray:
+        ev.append(f"cf-ray={_short_normalized_text(cf_ray, 120)}")
+        inf.append(
+            "Sinal típico de Cloudflare (cf-ray explícito) — mesmo que outros camadas existam atrás/a frente."
+        )
+
+    for _tok in ("cf-mitigated", "critical-challenge", "cf-cache-status"):
+        if _tok in hdr_join:
+            ev.append(_tok)
+
+    if srv:
+        ev.append(f"server={srv[:420]}")
+        if "ddos-guard" in srv or "ddguard" in srv:
+            inf.append(
+                "Cabeçalho Server contém marca DDoS-Guard NG — perímetro habitual em portais públicos PT."
+            )
+
+    lc_ck = (ck_hint + raw_ck).lower()
+    if "__ddg" in lc_ck or "__ddgid" in lc_ck or "__ddgs" in lc_ck:
+        inf.append(
+            "Cookie(s) nomeados __ddg* — marca forte de perímetro DDoS-Guard (cookie de proteção/desafío)."
+        )
+        ev.append("set-cookie_needle:__ddg*")
+
+    if "akamai" in srv or hdr_join.find("akamai") >= 0:
+        inf.append("Possível perímetro Akamai (Server ou cabeçalhos associados).")
+
+    if via and ("varnish" in via.lower() or "cloudflare" in via.lower()):
+        ev.append(f"via contains known edge hint")
+
+    perm_ver = headers_lc.get("permissions-policy") or headers_lc.get("permissions_policy")
+    if perm_ver:
+        ev.append("permissions-policy present")
+
+    # Desduplicar preservando ordem
+    dedup_inf: List[str] = []
+    for x in inf:
+        if x not in dedup_inf:
+            dedup_inf.append(x)
+    return dedup_inf, ev
+
+
+def _mne_build_antibot_diagnostic_payload(
+    response,
+    body_normalized: Optional[str],
+    *,
+    username: Optional[str],
+    ajax_click_sequence: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Pacote estrutural para correlacionar perímetro (/ch/HTML) vs rejeição JSON servlet.
+    Sem palavras-passe nem captcha tokens.
+    """
+    raw_set_cookie_lc = ""
+    try:
+        hdr_raw = getattr(response, "headers", None) or {}
+        if isinstance(hdr_raw, dict):
+            for _rk, _rv in hdr_raw.items():
+                if str(_rk).lower().startswith("set-cookie"):
+                    raw_set_cookie_lc += str(_rv).lower() + "; "
+        else:
+            for _rk, _rv in hdr_raw:
+                if str(_rk).lower().startswith("set-cookie"):
+                    raw_set_cookie_lc += str(_rv).lower() + "; "
+    except Exception:
+        raw_set_cookie_lc = ""
+    ck_needles: List[str] = []
+    for _needle in (
+        "__ddgid",
+        "__ddgmark",
+        "__ddg",
+        "__cf_bm",
+        "__cfruid",
+        "__cflb",
+        "cf_clearance",
+        "ak_bm",
+        "akamai",
+    ):
+        if _needle.replace("_", "") and _needle in raw_set_cookie_lc:
+            ck_needles.append(_needle)
+
+    hdr_lc = _mne_normalized_response_headers(response)
+    body_class, class_hints = _mne_classify_login_body_antibot(body_normalized)
+    hm = _mne_html_challenge_markers(body_normalized)
+    inferred, evid = _mne_infer_network_edge_signals(
+        hdr_lc, raw_set_cookie_joined_lc=raw_set_cookie_lc
+    )
+    rq_url = ""
+    rq_method = ""
+    post_ct = ""
+    try:
+        rq = getattr(response, "request", None)
+        if rq:
+            rq_url = str(getattr(rq, "url", "") or "")[:920]
+            rq_method = str(getattr(rq, "method", "") or "").upper()
+            try:
+                h2 = rq.headers
+                pk = ""
+                if isinstance(h2, dict):
+                    for _k in h2:
+                        if str(_k).lower() == "content-type":
+                            pk = str(h2.get(_k) or "")
+                            break
+                elif h2:
+                    pk = getattr(h2, "get", lambda _x: "")("content-type") or ""
+                post_ct = pk[:260]
+            except Exception:
+                post_ct = ""
+    except Exception:
+        pass
+
+    return {
+        "diag_version": 1,
+        "scope": "POST /VistosOnline/login XHR/adjacent",
+        "username_for_correlation_only": username,
+        "ajax_submit_click_index": ajax_click_sequence,
+        "response_url": (_short_normalized_text(getattr(response, "url", None) or "", 980)),
+        "http_status": getattr(response, "status", None),
+        "request_method_observed": rq_method,
+        "request_url_truncated": rq_url,
+        "request_content_type": post_ct,
+        "cookies_set_names_hint_truncated": _short_normalized_text(
+            _mne_gather_set_cookie_names_hint(hdr_lc),
+            800,
+        ),
+        "set_cookie_substring_signals_no_values": ck_needles,
+        "normalized_headers_truncated_sample": hdr_lc,
+        "body_antibot_classification": body_class,
+        "body_classification_hints": class_hints[:12],
+        "html_challenge_markers": hm,
+        "network_edge_inferences_precise_language": inferred,
+        "edge_header_evidence": evid[:28],
+        "explicit_summary_sentence": (
+            "Se `body_antibot_classification` começa por `perimeter_challenge_html_under_host_ch_star`, "
+            "o primeiro gate é o pacote `/ch/bd.js` no host MNE antes do resultado JSON de utilizador."
+            if body_class.startswith("perimeter_challenge")
+            else (
+                "Se é `application_json_login_rejection_or_recaptcha_gate`, "
+                "a antibot/perímetro passou até ao servlet AJAX; falha já na decisão aplicacional/Google verify."
+                if body_class.startswith("application_json")
+                else "Ver `body_classification_hints` para o caso intermediário ou corpo estranho."
+            )
+        ),
+    }
+
+
+async def _mne_inject_antibot_scripts_from_login_html(page, html: Optional[str]) -> None:
+    """Executa scripts do HTML minimalista /ch/ devolvido pelo POST /login no contexto da página."""
+    if not html or len(html.strip()) < 40:
+        return
+    if not _is_mne_login_antibot_challenge_html(html):
+        return
+    # Carregar bd.js primeiro (appendChild dinâmico por vezes perde corrida vs. CSP);
+    # add_script_tag segue o pipeline normal do Chromium.
+    try:
+        bd_url = f"{SITE_ORIGIN}/ch/bd.js"
+        await page.add_script_tag(url=bd_url)
+    except Exception:
+        pass
+    try:
+        await page.evaluate(
+            """(html) => {
+                const hm = typeof html === 'string' ? html : '';
+                if (!hm.length) {
+                    return;
+                }
+                window.__mneAntibotInlineSeq = (window.__mneAntibotInlineSeq || 0) + 1;
+                const div = document.createElement('div');
+                div.innerHTML = hm.slice(0, 150000);
+                const scripts = Array.from(div.querySelectorAll('script'));
+                for (const s of scripts) {
+                    const ne = document.createElement('script');
+                    const srcAttr = s.getAttribute('src');
+                    if (srcAttr) {
+                        let abs;
+                        try {
+                            abs = new URL(srcAttr, window.location.href).href;
+                        } catch (e) {
+                            abs = srcAttr;
+                        }
+                        // bd.js já puxámos por add_script_tag; evitar duplicar o mesmo recurso.
+                        if (abs.indexOf('/ch/bd.js') !== -1) {
+                            continue;
+                        }
+                        ne.src = abs;
+                    }
+                    const inline = (s.textContent || s.innerHTML || '');
+                    if (inline) {
+                        ne.textContent = inline;
+                    }
+                    if (!ne.src && !ne.textContent) {
+                        continue;
+                    }
+                    (document.body || document.documentElement).appendChild(ne);
+                }
+            }""",
+            html[:150000],
+        )
+    except Exception:
+        pass
+
+
+async def _mne_replay_login_submit_after_challenge_once(page) -> None:
+    """
+    Após `/ch/bd.js`, alguns exits nunca fazem POST /login de continuação até o formulário ser
+    re-disparado (doLogin/clique); o polling via hook ficava eternamente sem 2ª resposta na rede.
+    Até duas tentativas: após settle e a meio do poll (~35%).
+    """
+    try:
+        c = int(getattr(page, "_mne_challenge_login_replay_count", 0) or 0)
+        if c >= 2:
+            return
+        setattr(page, "_mne_challenge_login_replay_count", c + 1)
+    except Exception:
+        return
+    try:
+        outcome = "noop"
+        btn_loc = page.locator("#NewloginForm-d button#loginFormSubmitButton").first
+        if await btn_loc.count() > 0:
+            try:
+                await btn_loc.evaluate(
+                    """el => {
+                        try {
+                            el.removeAttribute('disabled');
+                            el.disabled = false;
+                        } catch (e) {}
+                    }"""
+                )
+            except Exception:
+                pass
+            try:
+                await btn_loc.click(delay=40, timeout=15000, force=True)
+                outcome = "playwright_click_force"
+            except Exception as _pw_click_err:
+                outcome = f"playwright_click:{str(_pw_click_err)[:120]}"
+                try:
+                    outcome = await page.evaluate(
+                        """() => {
+                            try {
+                                var btn = document.querySelector(
+                                    '#NewloginForm-d button#loginFormSubmitButton'
+                                );
+                                if (!btn) { return 'no_button'; }
+                                try {
+                                    btn.removeAttribute('disabled');
+                                    btn.disabled = false;
+                                } catch (e0) {}
+                                try {
+                                    if (typeof doLogin === 'function') {
+                                        doLogin(); return 'doLogin_called';
+                                    }
+                                } catch (e1) {}
+                                try {
+                                    if (typeof window.doLogin === 'function') {
+                                        window.doLogin(); return 'window_doLogin';
+                                    }
+                                } catch (e2) {}
+                                try {
+                                    btn.click();
+                                    return 'submit_click_js';
+                                } catch (e3) {}
+                                return 'noop_after_pw_fail';
+                            } catch (e) {
+                                return 'err:' + String(e).slice(0, 120);
+                            }
+                        }"""
+                    )
+                except Exception as _ev_err:
+                    outcome = f"{outcome};js_fallback:{str(_ev_err)[:80]}"
+        else:
+            outcome = await page.evaluate(
+                """() => {
+                    try {
+                        var btn = document.querySelector(
+                            '#NewloginForm-d button#loginFormSubmitButton'
+                        );
+                        if (!btn) { return 'no_button'; }
+                        try {
+                            btn.removeAttribute('disabled');
+                            btn.disabled = false;
+                        } catch (e0) {}
+                        try {
+                            if (typeof doLogin === 'function') {
+                                doLogin(); return 'doLogin_called';
+                            }
+                        } catch (e1) {}
+                        try {
+                            if (typeof window.doLogin === 'function') {
+                                window.doLogin(); return 'window_doLogin';
+                            }
+                        } catch (e2) {}
+                        try {
+                            btn.click();
+                            return 'submit_click';
+                        } catch (e3) {}
+                        return 'noop';
+                    } catch (e) {
+                        return 'err:' + String(e).slice(0, 120);
+                    }
+                }"""
+            )
+        logger.info(
+            "[Playwright] /ch/ challenge — replay de fluxo login "
+            f"{c + 1}/2: {outcome!r}"
+        )
+    except Exception as _replay_ex:
+        logger.debug(f"[Playwright] replay pós-/ch/ falhou: {_replay_ex}")
+
+
+async def _mne_sleep_poll_ajax_login_json_after_challenge(
+    page, max_wait_s: float = 18.0, challenge_html: Optional[str] = None,
+) -> Optional[dict]:
+    """Após corpo HTML /ch/, o browser pode concluir JS e preencher _lastLoginResult."""
+    try:
+        setattr(page, "_mne_challenge_login_replay_count", 0)
+    except Exception:
+        pass
+    # Evitar duplicar bd.js quando handle_login_response já injectou antes de lr_fut().
+    if not getattr(page, "_mne_login_challenge_early_inject_done", False):
+        await _mne_inject_antibot_scripts_from_login_html(page, challenge_html)
+    # Dar tempo ao /ch/bd.js + script inline antes de iniciar polling.
+    try:
+        await page.wait_for_timeout(3800)
+    except Exception:
+        pass
+    # networkidle atrasa demais quando o PoW/abas mantêm ligações abertas; um settle curto chega.
+    try:
+        await page.wait_for_timeout(
+            int(min(4000.0, max(1200.0, float(max_wait_s) * 220.0))),
+        )
+    except Exception:
+        pass
+    await _mne_replay_login_submit_after_challenge_once(page)
+
+    def _peek_login_result_python() -> Optional[dict]:
+        try:
+            lr = getattr(page, "_login_result", None)
+            if isinstance(lr, dict) and str(lr.get("type") or "").strip():
+                raw_v = lr.get("raw")
+                if isinstance(raw_v, str) and _is_mne_login_antibot_challenge_html(raw_v):
+                    return None
+                return lr
+        except Exception:
+            pass
+        return None
+
+    n = max(5, int(max_wait_s / 0.5))
+    replay_mid_at = min(n - 1, max(8, int(n * 0.35)))
+    for i in range(n):
+        pt = _peek_login_result_python()
+        if pt is not None:
+            return pt
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            return None
+        if i == replay_mid_at:
+            await _mne_replay_login_submit_after_challenge_once(page)
+        try:
+            data = await page.evaluate(
+                """() => {
+                    let p = window._lastLoginResult;
+                    const raw = window._lastLoginRaw || '';
+                    if (!p && raw) {
+                        try { p = JSON.parse(raw); } catch (e) {}
+                    }
+                    return (p && typeof p === 'object') ? p : null;
+                }"""
+            )
+            if isinstance(data, dict) and str(data.get("type") or "").strip():
+                return data
+        except Exception:
+            pass
+    return _peek_login_result_python()
+
+
 async def _page_service_unavailable_snapshot(page) -> tuple[bool, str, str]:
     title = ""
     visible_text = ""
@@ -1184,6 +1822,315 @@ async def _page_service_unavailable_snapshot(page) -> tuple[bool, str, str]:
     visible_text = _normalize_server_text(visible_text)
     combined = "\n".join(part for part in (title, visible_text) if part)
     return _is_mne_service_unavailable_text(combined), title, visible_text
+
+
+# reCAPTCHA v2 Enterprise: many pages only assign `window.captchaWidget` after
+# render/async init. Probe DOM + ___grecaptcha_cfg before forcing 0.
+_RESOLVE_CAPTCHA_WIDGET_JS = """() => {
+    const out = {
+        captchaWidget_defined: false,
+        captchaWidget_value: null,
+        widget_id: 0,
+        source: "fallback_0",
+    };
+    try {
+        if (
+            typeof window.captchaWidget !== "undefined"
+            && window.captchaWidget !== null
+            && window.captchaWidget !== ""
+        ) {
+            out.captchaWidget_defined = true;
+            out.captchaWidget_value = window.captchaWidget;
+            out.widget_id = window.captchaWidget;
+            out.source = "window.captchaWidget";
+            return out;
+        }
+        const div = document.querySelector(".g-recaptcha[data-widget-id]");
+        if (div) {
+            const w = div.getAttribute("data-widget-id");
+            if (w !== null && w !== "") {
+                const num = Number(w);
+                window.captchaWidget = Number.isFinite(num) ? num : w;
+                out.captchaWidget_defined = true;
+                out.captchaWidget_value = window.captchaWidget;
+                out.widget_id = window.captchaWidget;
+                out.source = "data-widget-id";
+                return out;
+            }
+        }
+        try {
+            const cfg =
+                typeof window.___grecaptcha_cfg !== "undefined"
+                    ? window.___grecaptcha_cfg
+                    : null;
+            const clients = cfg && cfg.clients;
+            if (clients && typeof clients === "object") {
+                const numeric = new Set();
+                for (const idx of Object.keys(clients)) {
+                    const client = clients[idx];
+                    if (!client || typeof client !== "object") continue;
+                    for (const key of Object.keys(client)) {
+                        if (/^-?\\d+$/.test(key)) numeric.add(Number(key));
+                    }
+                }
+                if (numeric.size >= 1) {
+                    const pick = Math.min(...numeric);
+                    window.captchaWidget = pick;
+                    out.captchaWidget_defined = true;
+                    out.captchaWidget_value = pick;
+                    out.widget_id = pick;
+                    out.source = "___grecaptcha_cfg";
+                    return out;
+                }
+            }
+        } catch (e2) {
+            void 0;
+        }
+        const gr = typeof window.grecaptcha !== "undefined" ? window.grecaptcha : null;
+        if (gr !== null) {
+            if (typeof window.captchaWidget === "undefined" || window.captchaWidget === null) {
+                window.captchaWidget = 0;
+            }
+            const hasGetter =
+                typeof gr.getResponse === "function"
+                || (gr.enterprise && typeof gr.enterprise.getResponse === "function");
+            out.captchaWidget_defined = true;
+            out.captchaWidget_value = window.captchaWidget;
+            out.widget_id = window.captchaWidget;
+            out.source = hasGetter
+                ? "default_0_grecaptcha_ready"
+                : "default_0_grecaptcha_object";
+            return out;
+        }
+        out.source = "unresolved_no_grecaptcha";
+        return out;
+    } catch (e) {
+        out.source =
+            "error_" + String(e && e.message ? e.message : e).slice(0, 80);
+        return out;
+    }
+}"""
+
+
+async def _await_captcha_widget_binding(
+    page, max_wait_s: float = 5.0, interval_s: float = 0.2
+) -> dict:
+    """Poll until captchaWidget, data-widget-id, or ___grecaptcha_cfg resolves."""
+    deadline = time.time() + max(0.5, float(max_wait_s))
+    interval_s = max(0.05, float(interval_s))
+    last: dict = {}
+    definitive = frozenset(
+        {
+            "window.captchaWidget",
+            "data-widget-id",
+            "___grecaptcha_cfg",
+            "default_0_grecaptcha_ready",
+            "default_0_grecaptcha_object",
+        }
+    )
+    while time.time() < deadline:
+        try:
+            last = await page.evaluate(_RESOLVE_CAPTCHA_WIDGET_JS) or {}
+        except Exception:
+            await asyncio.sleep(interval_s)
+            continue
+        src = str(last.get("source") or "")
+        if src in definitive:
+            return last
+        await asyncio.sleep(interval_s)
+    return last or {}
+
+
+_MNE_CIRCUIT_STATE = {
+    "events": [],
+    "pause_until": 0.0,
+    "reason": "",
+}
+
+
+def _mne_circuit_config() -> tuple[bool, int, int, float, float]:
+    enabled = _cfg_bool("ddos_safe_mode", True)
+    threshold = max(1, _cfg_int("ddos_circuit_breaker_failures", 2))
+    window_s = max(10, _cfg_int("ddos_circuit_breaker_window_sec", 180))
+    pause_s = max(30.0, _cfg_float("ddos_circuit_breaker_pause_sec", 900.0))
+    probe_interval_s = max(10.0, _cfg_float("ddos_health_probe_interval_sec", 60.0))
+    return enabled, threshold, window_s, pause_s, probe_interval_s
+
+
+def _mne_circuit_remaining() -> float:
+    if not _cfg_bool("ddos_safe_mode", True):
+        return 0.0
+    return max(0.0, float(_MNE_CIRCUIT_STATE.get("pause_until") or 0.0) - time.time())
+
+
+def _mne_circuit_record_success() -> None:
+    if not _cfg_bool("ddos_safe_mode", True):
+        return
+    _MNE_CIRCUIT_STATE["events"] = []
+    if _mne_circuit_remaining() <= 0:
+        _MNE_CIRCUIT_STATE["reason"] = ""
+
+
+def _mne_circuit_record_failure(reason: str) -> float:
+    enabled, threshold, window_s, pause_s, _ = _mne_circuit_config()
+    if not enabled:
+        return 0.0
+    now = time.time()
+    events = [
+        ts for ts in (_MNE_CIRCUIT_STATE.get("events") or [])
+        if now - float(ts) <= window_s
+    ]
+    events.append(now)
+    _MNE_CIRCUIT_STATE["events"] = events
+    if len(events) >= threshold:
+        _MNE_CIRCUIT_STATE["pause_until"] = max(
+            float(_MNE_CIRCUIT_STATE.get("pause_until") or 0.0),
+            now + pause_s,
+        )
+        _MNE_CIRCUIT_STATE["reason"] = str(reason or "site_unavailable")[:200]
+        return pause_s
+    return 0.0
+
+
+async def _mne_circuit_sleep_if_open(label: str = "worker") -> bool:
+    remaining = _mne_circuit_remaining()
+    if remaining <= 0:
+        return False
+    logger.warning(
+        f"[DDoSGuard] Circuit breaker aberto ({label}): pausando {remaining:.0f}s "
+        f"antes de novo acesso ao MNE. motivo={_MNE_CIRCUIT_STATE.get('reason') or '-'}"
+    )
+    await asyncio.sleep(min(remaining, 300.0))
+    return True
+
+
+def _mne_probe_curl_exc_suggests_httpx_fallback(exc: BaseException) -> bool:
+    """
+    curl_cffi às vezes rebenta com erro OpenSSL neste host Windows (curl 35 /
+    OPENSSL_internal) sem haver problema no MNE. Nesse caso tentamos httpx
+    antes de registar falha no circuit breaker.
+    """
+    s = str(exc).lower()
+    if any(
+        needle in s
+        for needle in (
+            "(35)",
+            "tls connect error",
+            "ssl_connect",
+            "openssl_internal",
+            "openssl",
+            "invalid library",
+            "error:00000000",
+            "certificate verify failed",
+            "ssl syscall",
+            "wrong_version_number",
+            "unexpected eof",
+            "failed to negotiate",
+            "ssl routines",
+            "ssl error",
+            "sslctx",
+            "handshake failure",
+            "sslv3",
+        )
+    ):
+        return True
+    return False
+
+
+def _mne_health_probe_once(proxy_raw: Optional[str] = None, timeout_s: float = 12.0) -> tuple[bool, int, str]:
+    """Cheap MNE health probe. True means safe enough to claim a user."""
+    target = f"{BASE_URL}/VistosOnline/"
+    headers = {
+        "User-Agent": user_agents[0] if user_agents else "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    def _classify_preview(status_code: int, raw_text: str) -> tuple[bool, int, str]:
+        preview = _short_normalized_text(raw_text or "", 240)
+        if int(status_code or 0) >= 500 or _is_mne_service_unavailable_text(preview):
+            return False, int(status_code or 0), preview
+        return True, int(status_code or 0), preview
+
+    session = None
+    curl_fallback_message = ""
+
+    try:
+        session = curl_requests.Session(impersonate="chrome120")
+        session.headers.update(headers)
+        if proxy_raw and not _is_direct_proxy(proxy_raw):
+            proxy_url = _proxy_to_http_url(proxy_raw)
+            if proxy_url:
+                session.proxies = {"http": proxy_url, "https": proxy_url}
+        resp = session.get(target, timeout=timeout_s, allow_redirects=True)
+        return _classify_preview(
+            int(resp.status_code or 0),
+            getattr(resp, "text", "") or "",
+        )
+    except Exception as exc:
+        if not _mne_probe_curl_exc_suggests_httpx_fallback(exc):
+            return False, 0, str(exc)[:240]
+        curl_fallback_message = str(exc)[:200]
+        logger.info(
+            "[DDoSGuard] Sonda curl_cffi falhou neste sistema (transporte TLS/stack). "
+            f"Réplica rápida com httpx antes de penalizar circuito. erro={curl_fallback_message}"
+        )
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+
+    proxy_url_ht = (
+        _proxy_to_http_url(proxy_raw)
+        if proxy_raw and not _is_direct_proxy(proxy_raw)
+        else None
+    )
+    try:
+        with httpx.Client(
+            proxy=proxy_url_ht,
+            timeout=timeout_s,
+            follow_redirects=True,
+        ) as client:
+            r = client.get(target, headers=headers)
+            ok, status, preview = _classify_preview(int(r.status_code or 0), r.text or "")
+            if ok:
+                logger.debug(
+                    f"[DDoSGuard] Sonda httpx OK (fallback) status={status} "
+                    f"proxied={proxy_url_ht is not None}"
+                )
+            return ok, status, preview
+    except Exception as exc2:
+        combined = (
+            f"curl_fallback_httpx: curl={curl_fallback_message[:96]} "
+            f"httpx={str(exc2)[:120]}"
+        )
+        return False, 0, combined[:240]
+
+
+async def _mne_health_probe(proxy_raw: Optional[str] = None, label: str = "worker") -> bool:
+    if not _cfg_bool("ddos_safe_mode", True):
+        return True
+    if await _mne_circuit_sleep_if_open(label):
+        return False
+    timeout_s = max(3.0, _cfg_float("ddos_health_probe_timeout_sec", 12.0))
+    loop = asyncio.get_running_loop()
+    ok, status, preview = await loop.run_in_executor(
+        None, _mne_health_probe_once, proxy_raw, timeout_s
+    )
+    if ok:
+        _mne_circuit_record_success()
+        logger.debug(f"[DDoSGuard] Health OK ({label}): status={status}")
+        return True
+    pause_s = _mne_circuit_record_failure(f"health_probe status={status} text={preview}")
+    logger.warning(
+        f"[DDoSGuard] Health FAIL ({label}): status={status} text={preview!r} "
+        f"pause={'opened '+str(int(pause_s))+'s' if pause_s else 'not yet'}"
+    )
+    return False
 
 
 def _is_direct_proxy(proxy_raw: Optional[str]) -> bool:
@@ -1226,6 +2173,65 @@ def _parse_proxy_raw(proxy_raw: Optional[str]) -> Optional[Tuple[str, str, str, 
     if not host or not port or not username or not password:
         return None
     return host, port, username, password
+
+
+def _resolve_hostname_to_ipv4_list(
+    host: Optional[str],
+    timeout_sec: float = 5.0,
+    max_addrs: int = 16,
+) -> List[str]:
+    """All IPv4 addresses for hostname (multiple A-records); SOAX/AWS edges differ per solver POP."""
+    out: List[str] = []
+    if not host or not str(host).strip():
+        return out
+    h = str(host).strip().strip("[]")
+    try:
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", h) and all(
+            0 <= int(octet) <= 255 for octet in h.split(".")
+        ):
+            return [h]
+        old_timeout = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(timeout_sec)
+            infos = socket.getaddrinfo(h, None, socket.AF_INET, socket.SOCK_STREAM)
+            seen = set()
+            for ai in infos:
+                addr = ai[4][0]
+                if not isinstance(addr, str):
+                    continue
+                ps = addr.split(".")
+                if len(ps) != 4:
+                    continue
+                try:
+                    if not all(0 <= int(p) <= 255 for p in ps):
+                        continue
+                except ValueError:
+                    continue
+                if addr not in seen:
+                    seen.add(addr)
+                    out.append(addr)
+                    if len(out) >= max_addrs:
+                        break
+        finally:
+            try:
+                socket.setdefaulttimeout(old_timeout)
+            except Exception:
+                socket.setdefaulttimeout(None)
+    except Exception as _resolver_err:
+        try:
+            logger.warning(
+                f"[Captcha] Falha listar IPs do proxy host {h!r}: {_resolver_err}"
+            )
+        except Exception:
+            pass
+        return []
+    return out
+
+
+def _resolve_hostname_to_ipv4(host: Optional[str], timeout_sec: float = 5.0) -> Optional[str]:
+    """First IPv4 (compat); prefer multiple candidates handled by _resolve_hostname_to_ipv4_list."""
+    lst = _resolve_hostname_to_ipv4_list(host, timeout_sec)
+    return lst[0] if lst else None
 
 
 def _proxy_to_http_url(proxy_raw: str) -> Optional[str]:
@@ -1492,17 +2498,51 @@ def captcha_stats_report() -> str:
 # Configuração do Redis
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_ENABLED_ENV = os.getenv('REDIS_ENABLED')
+
+
+def _cfg_bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _redis_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Redis is optional. Enable it explicitly to avoid noisy localhost warnings."""
+    if REDIS_ENABLED_ENV is not None:
+        return _cfg_bool_value(REDIS_ENABLED_ENV)
+    if settings and "redis_enabled" in settings:
+        return _cfg_bool_value(settings.get("redis_enabled"))
+    return False
+
+
+def _connect_redis(settings: Optional[Dict[str, Any]] = None):
+    if not _redis_enabled(settings):
+        return None, "disabled", None
+    host = str((settings or {}).get("redis_host") or REDIS_HOST)
+    port = int((settings or {}).get("redis_port") or REDIS_PORT)
+    try:
+        client = redis.Redis(host=host, port=port, decode_responses=True)
+        client.ping()
+        return client, f"{host}:{port}", None
+    except Exception as exc:
+        return None, f"{host}:{port}", exc
 
 class StateManager:
-    def __init__(self):
+    def __init__(self, settings: Optional[Dict[str, Any]] = None):
         self.r = None
-        try:
-            self.r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-            self.r.ping()
-            safe_print("[Redis] ✅ Conectado.")
-        except Exception as e:
-            self.r = None
-            safe_print(f"[Redis] ❌ Erro: {e}. Continuando sem persistência distribuída.")
+        self.r, _redis_target, _redis_err = _connect_redis(settings or scraper_settings)
+        if self.r:
+            safe_print(f"[Redis] ✅ Conectado ({_redis_target}).")
+        elif _redis_err:
+            safe_print(
+                f"[Redis] ⚠️ Indisponível em {_redis_target}: {_redis_err}. "
+                "Continuando sem persistência distribuída."
+            )
+        else:
+            safe_print("[Redis] desativado; usando estado local/in-memory.")
 
     # --- JAIL ---
     def is_user_jailed(self, username: str) -> bool:
@@ -2462,33 +3502,85 @@ async def send_telegram_alert(message: str):
         except NameError:
             print(f"[Telegram] Falha ao enviar alerta: {e}")
 
-async def check_api_balance():
-    """Verifica o saldo da API de Captcha. Retorna False se estiver baixo."""
-    try:
-        # Pega a chave do config
-        api_key = scraper_settings.get('anti_captcha_api_key')
-        if isinstance(api_key, list): api_key = api_key[0] # Pega a primeira se for lista
-        if not api_key:
-            return True # Se não tem chave configurada, ignora
+def _normalize_key_list(key_value):
+    if key_value is None:
+        return []
+    if isinstance(key_value, str):
+        return [key_value.strip()] if key_value.strip() else []
+    if isinstance(key_value, (list, tuple)):
+        return [str(k).strip() for k in key_value if k and str(k).strip()]
+    return []
 
-        url = "https://api.anti-captcha.com/getBalance"
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json={"clientKey": api_key}, timeout=10.0)
+
+def _captcha_balance_sync(provider: str, api_key: str, timeout_s: float = 10.0) -> Optional[float]:
+    """Return provider balance when a provider exposes a JSON getBalance endpoint."""
+    provider = str(provider or "").strip().lower()
+    if not api_key:
+        return None
+    url_by_provider = {
+        "anti-captcha": "https://api.anti-captcha.com/getBalance",
+        "2captcha": "https://api.2captcha.com/getBalance",
+        "capmonster": "https://api.capmonster.cloud/getBalance",
+        "capsolver": "https://api.capsolver.com/getBalance",
+    }
+    url = url_by_provider.get(provider)
+    if not url:
+        return None
+    try:
+        with httpx.Client(timeout=timeout_s, trust_env=False) as client:
+            resp = client.post(url, json={"clientKey": api_key})
             data = resp.json()
-            
-            balance = float(data.get('balance', 0))
-            
-            if balance < 2.0: # Se tiver menos de $2 dólares
-                await send_telegram_alert(
-                    f"🚨 <b>ALERTA DE SALDO!</b>\n"
-                    f"💰 Saldo Baixo: <b>${balance:.2f}</b>\n"
-                    f"🛑 O bot está pausado até recarregar."
-                )
-                logger.error(f"🚨 SALDO BAIXO: ${balance:.2f}. Pausando processos...")
-                return False
-            else:
-                logger.info(f"💰 Saldo OK: ${balance:.2f}")
-                return True
+        if isinstance(data, dict):
+            if int(data.get("errorId") or 0) != 0:
+                return None
+            if data.get("balance") is not None:
+                return float(data.get("balance"))
+    except Exception:
+        return None
+    return None
+
+
+async def check_api_balance():
+    """Log balances for configured CAPTCHA providers. Retorna False se todos saldos conhecidos forem baixos."""
+    try:
+        provider_keys = {
+            "anti-captcha": _normalize_key_list(scraper_settings.get('anti_captcha_api_key')),
+            "2captcha": _normalize_key_list(scraper_settings.get('twocaptcha_api_key')),
+            "capmonster": _normalize_key_list(scraper_settings.get('capmonster_api_key')),
+            "capsolver": _normalize_key_list(scraper_settings.get('capsolver_api_key')),
+        }
+        probe_items = [
+            (provider, keys[0])
+            for provider, keys in provider_keys.items()
+            if keys
+        ]
+        if not probe_items:
+            return True
+
+        loop = asyncio.get_running_loop()
+        known_balances = []
+        for provider, api_key in probe_items:
+            bal = await loop.run_in_executor(None, _captcha_balance_sync, provider, api_key)
+            if bal is None:
+                logger.info(f"💰 Saldo {provider}: indisponível")
+                continue
+            known_balances.append((provider, bal))
+            logger.info(f"💰 Saldo {provider}: ${bal:.4f}")
+
+        if not known_balances:
+            return True
+        usable = [(provider, bal) for provider, bal in known_balances if bal >= 2.0]
+        if usable:
+            return True
+
+        lowest_summary = ", ".join(f"{provider}=${bal:.2f}" for provider, bal in known_balances)
+        await send_telegram_alert(
+            f"🚨 <b>ALERTA DE SALDO!</b>\n"
+            f"💰 Saldos baixos: <b>{lowest_summary}</b>\n"
+            f"🛑 O bot está pausado até recarregar."
+        )
+        logger.error(f"🚨 SALDOS CAPTCHA BAIXOS: {lowest_summary}. Pausando processos...")
+        return False
     except Exception as e:
         logger.warning("Não foi possível checar saldo: %r", e)
     return True
@@ -2506,7 +3598,7 @@ async def send_status_report(credentials_file_path: str):
         if 'status' not in df.columns:
             return
             
-        df['status'] = df['status'].astype(str).str.strip().str.lower()
+        df['status'] = df['status'].map(_norm_csv_status)
         success_count = len(df[df['status'] == 'true'])
         pending_count = len(df[df['status'] == 'pending'])
         failed_count = total - success_count - pending_count
@@ -2607,15 +3699,20 @@ def update_csv_status(username: str, status: str, csv_file: str = 'creds_2.csv',
         updated = False
         user_found = False
         
-        with open(csv_path, 'r', encoding='utf-8', newline='') as f:
+        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
             reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
+            fieldnames = [
+                str(name).lstrip('\ufeff') if name is not None else name
+                for name in (reader.fieldnames or [])
+            ]
+            reader.fieldnames = fieldnames
              # CORREÇÃO: Se fieldnames for None (arquivo vazio), falha graciosamente
             if not fieldnames:
                  log_warn(f"[CSV Update] CSV file has no headers: {csv_path}")
                  return False
             for row in reader:
-                if row.get('username') == username:
+                row_username = str(row.get('username') or '').strip().lstrip('\ufeff')
+                if row_username == username:
                     user_found = True
                     current_status = row.get('status', '').strip().lower()
                     
@@ -2942,6 +4039,189 @@ def _current_run_log_path() -> str:
     return os.path.join(_runtime_logs_dir(), f"visa_bot_run_{run_id}.log")
 
 
+_blocking_diag_file_lock = threading.Lock()
+
+
+def _redact_proxy_for_report(proxy_raw: Optional[str]) -> str:
+    """Host:port apenas — não gravar utilizador/password do proxy no relatório."""
+    if not proxy_raw or not str(proxy_raw).strip():
+        return ""
+    raw = str(proxy_raw).strip()
+    try:
+        if _is_direct_proxy(proxy_raw):
+            return "direct"
+    except Exception:
+        pass
+    parts = raw.split(":")
+    if len(parts) >= 2:
+        return f"{parts[0]}:{parts[1]}"
+    return raw[:48]
+
+
+def _egress_ipv4_hint_for_blocking_report(val: Optional[str]) -> str:
+    """Prefer validator exit IPv4 (`_visa_proxy_validator_exit_ipv4`) when available."""
+    try:
+        s = str(val or "").strip()
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    if len(s) > 42:
+        return s[:42]
+    try:
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", s):
+            parts = s.split(".")
+            if len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts):
+                return s
+    except ValueError:
+        pass
+    return s
+
+
+def _blocking_diagnostics_success_baseline_enabled() -> bool:
+    try:
+        return _cfg_bool("blocking_diagnostics_success_baseline", True)
+    except Exception:
+        return True
+
+
+def _blocking_diagnostics_report_enabled() -> bool:
+    try:
+        return _cfg_bool("blocking_diagnostics_report", True)
+    except Exception:
+        return True
+
+
+def _blocking_diagnostics_report_hints_enabled() -> bool:
+    try:
+        return _cfg_bool("blocking_diagnostics_log_operational_hints", True)
+    except Exception:
+        return True
+
+
+def _blocking_diagnostics_report_path() -> str:
+    rel = "mne_blocking_report.jsonl"
+    try:
+        if scraper_settings:
+            rel = str(scraper_settings.get("blocking_diagnostics_report_path") or rel).strip()
+    except Exception:
+        pass
+    if not rel:
+        rel = "mne_blocking_report.jsonl"
+    abs_p = rel if os.path.isabs(rel) else os.path.join(WORKING_DIR, rel)
+    try:
+        d = os.path.dirname(os.path.abspath(abs_p))
+        if d:
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return abs_p
+
+
+def blocking_diagnostics_emit(
+    *,
+    phase: str,
+    username: str,
+    proxy_raw: Optional[str] = None,
+    egress_ipv4_hint: Optional[str] = None,
+    http_status: Optional[int] = None,
+    ajax_submit_click_index: Optional[int] = None,
+    network_login_post_count: Optional[int] = None,
+    server_message_type: Optional[str] = None,
+    server_message_desc: Optional[str] = None,
+    body_antibot_classification: Optional[str] = None,
+    challenge_poll_budget_sec: Optional[float] = None,
+    challenge_replay_js_count: Optional[int] = None,
+    seconds_since_login_start: Optional[float] = None,
+    seconds_captcha_to_submit: Optional[float] = None,
+    page_url: Optional[str] = None,
+    user_agent_short: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Registo estruturado (JSON Lines) quando o fluxo encontrar resistência forte do site.
+
+    As `operational_hints` resumem práticas de fiabilidade publicamente referidas pela Google
+    (tempo útil token reCAPTCHA/Enterprise ~2min), OWASP / rate-limiting progressivo,
+    consistência fingerprint↔sessão ao nível aplicacional — sem promover evasão.
+    """
+    if not _blocking_diagnostics_report_enabled():
+        return
+    rid = os.environ.get("VISA_BOT_RUN_ID", "").strip()
+    uname_r = ""
+    try:
+        u = username or ""
+        uname_r = (u[:2] + "…" + u[-1]) if len(u) > 3 else u
+    except Exception:
+        uname_r = ""
+    payload: Dict[str, Any] = {
+        "diag_schema": "mne_blocking_v1",
+        "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "run_id": rid,
+        "phase": phase,
+        "username_redacted": uname_r,
+        "proxy_host_port": _redact_proxy_for_report(proxy_raw),
+        "egress_ipv4_hint": (egress_ipv4_hint or "")[:42],
+        "http_status": http_status,
+        "ajax_click_index": ajax_submit_click_index,
+        "network_login_post_count": network_login_post_count,
+        "server_message_type": server_message_type,
+        "server_message_desc_preview": (
+            _normalize_server_text(str(server_message_desc or ""))[:400]
+            if server_message_desc
+            else None
+        ),
+        "body_antibot_classification": body_antibot_classification,
+        "challenge_poll_budget_sec": challenge_poll_budget_sec,
+        "challenge_replay_js_count": challenge_replay_js_count,
+        "seconds_since_login_start": seconds_since_login_start,
+        "seconds_captcha_to_submit": seconds_captcha_to_submit,
+        "page_url": (_normalize_server_text(page_url or "")[:500]) if page_url else "",
+        "user_agent_browser_prefix": (user_agent_short or "")[:260],
+    }
+    hints: List[str] = []
+    if _blocking_diagnostics_report_hints_enabled():
+        hints = [
+            "reCAPTCHA Enterprise: TTL ~120s desde emissão; minimizar tempo entre solver e POST /login.",
+            "Manter egress IP estável durante o passe browser↔solve quando o servidor avalia sessão aplicacional.",
+            "Evitar rajadas POST /login com o mesmo token (pode elevar probabilidade HTML /ch/bd.js como visto nos logs).",
+            "Backoff exponencial antes de novo solve quando `perimeter_challenge_html` persiste.",
+        ]
+        payload["operational_hints"] = hints
+    if extra:
+        payload["extra"] = extra
+
+    dest = _blocking_diagnostics_report_path()
+    try:
+        line = json.dumps(payload, ensure_ascii=False, default=str)
+        with _blocking_diag_file_lock:
+            with open(dest, "a", encoding="utf-8") as fa:
+                fa.write(line + "\n")
+    except Exception as werr:
+        try:
+            logger.warning(
+                "[BlockingDiag] falha ao anexar linha ao relatório (%s): %s", dest, werr
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        logger.info("[BlockingFactors] phase=%s report=%s", phase, os.path.basename(dest))
+        if hints:
+            logger.info(
+                "[BlockingFactors] refs operacionais: %s",
+                " │ ".join(h[:200] for h in hints[:2]),
+            )
+    except Exception:
+        pass
+
+
+def _local_debug_artifacts_enabled(settings: Optional[Dict] = None) -> bool:
+    effective_settings = settings or scraper_settings or {}
+    return _coerce_bool(effective_settings.get("local_debug_artifacts", False), False)
+
+
 def _cleanup_orphaned_playwright_browsers(settings: Optional[Dict] = None) -> int:
     effective_settings = settings or scraper_settings or {}
     if os.name != "nt":
@@ -3065,6 +4345,142 @@ Select-Object -ExpandProperty ProcessId
         return 0
 
 
+def _cleanup_run_owned_browser_processes(settings: Optional[Dict] = None) -> int:
+    """Kill browser children launched by this bot, without touching user browsers."""
+    effective_settings = settings or scraper_settings or {}
+    if os.name != "nt":
+        return 0
+    if not _coerce_bool(
+        effective_settings.get("cleanup_orphaned_playwright_browsers_on_start", True),
+        True,
+    ):
+        return 0
+    markers = (
+        "playwright_chromiumdev_profile-",
+        "--remote-debugging-pipe",
+        "--disable-blink-features=AutomationControlled",
+    )
+    marker_expr = " -or ".join(
+        f"$_.CommandLine -like '*{marker}*'" for marker in markers
+    )
+    ps_query = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -match '^(chrome|msedge)\\.exe$' -and "
+        f"({marker_expr}) }} | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        query = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_query],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        pids = []
+        for line in (query.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        killed = 0
+        for pid in sorted(set(pids)):
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if result.returncode == 0:
+                killed += 1
+        if killed:
+            logging.getLogger().warning(
+                f"[Cleanup] Killed {killed} run-owned browser process tree(s): {sorted(set(pids))}"
+            )
+        return killed
+    except Exception as cleanup_err:
+        logging.getLogger().warning(
+            f"[Cleanup] Failed to clear run-owned browser processes: {cleanup_err}"
+        )
+        return 0
+
+
+def stop_running_bot_processes(settings: Optional[Dict] = None) -> int:
+    """
+    Stop all other running visa_bot.py process trees plus bot-owned browser children.
+    Intended CLI usage: python visa_bot.py --stop-bots
+    """
+    effective_settings = settings or scraper_settings or {
+        "cleanup_orphaned_playwright_browsers_on_start": True
+    }
+    stopped = 0
+    if os.name != "nt":
+        print("[StopBots] stop-bots is currently implemented for Windows only.")
+        return 0
+
+    current_pid = os.getpid()
+    script_name = os.path.basename(__file__)
+    script_path = os.path.abspath(__file__).replace("\\", "\\\\")
+    ps_query = rf"""
+Get-CimInstance Win32_Process |
+Where-Object {{
+  $_.ProcessId -ne {current_pid} -and
+  $_.Name -match '^(python|pythonw|py|powershell)\.exe$' -and
+  (
+    $_.CommandLine -like '*{script_name}*' -or
+    $_.CommandLine -like '*{script_path}*'
+  )
+}} |
+Select-Object -ExpandProperty ProcessId
+"""
+    try:
+        query = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_query],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        pids = []
+        for line in (query.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        for pid in sorted(set(pids)):
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if result.returncode == 0:
+                stopped += 1
+                print(f"[StopBots] stopped bot process tree pid={pid}")
+    except Exception as stop_err:
+        print(f"[StopBots] failed to stop bot process trees: {stop_err}")
+
+    try:
+        stopped += _cleanup_run_owned_browser_processes(effective_settings)
+    except Exception as browser_err:
+        print(f"[StopBots] failed to stop bot-owned browsers: {browser_err}")
+    try:
+        stopped += _cleanup_orphaned_playwright_browsers(effective_settings)
+    except Exception as browser_err:
+        print(f"[StopBots] failed to stop orphan Playwright browsers: {browser_err}")
+    try:
+        stopped += _cleanup_orphaned_bot_processes(effective_settings)
+    except Exception as bot_err:
+        print(f"[StopBots] failed to stop orphan bot workers: {bot_err}")
+
+    print(f"[StopBots] total stopped/cleaned: {stopped}")
+    return stopped
+
+
 def setup_logging(process_id: int = 0, settings: Optional[Dict] = None):
     """Setup logging for each process with Process ID prefix"""
     effective_settings = settings or scraper_settings or {}
@@ -3080,6 +4496,17 @@ def setup_logging(process_id: int = 0, settings: Optional[Dict] = None):
 
     handler = colorlog.StreamHandler()
     handler.setLevel(console_level)
+    # Redirecionar stderr (ex.: Start-Sleep + Stop-Process): flush por linha evita logs truncados.
+    _orig_console_emit = handler.emit
+
+    def _emit_and_flush(record):
+        _orig_console_emit(record)
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+    handler.emit = _emit_and_flush
     # ADICIONADO O PREFIXO [Proc-{process_id}]
     formatter = colorlog.ColoredFormatter(
         fmt="%(log_color)s[Proc-%(process_id)s] %(asctime)s - %(levelname)-8s - %(message)s",
@@ -3143,6 +4570,8 @@ def _error_logs_dir() -> str:
 
 def _append_error_register_line(record: dict) -> None:
     """Append one JSON object to logs/error_register.jsonl (best-effort; multi-process safe enough for triage)."""
+    if not _local_debug_artifacts_enabled():
+        return
     try:
         path = os.path.join(_error_logs_dir(), "error_register.jsonl")
         line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -3204,6 +4633,16 @@ async def capture_browser_error_bundle(
     """
     log = logging.getLogger()
     cfg = scraper_settings or {}
+    if not _local_debug_artifacts_enabled(cfg):
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        log.warning(
+            f"[BrowserCapture] local_debug_artifacts=false; skip artifact capture "
+            f"(reason={reason}, url={url[:120]})"
+        )
+        return None
     max_text = int(cfg.get("browser_error_max_text_chars", 12000))
     max_html = int(cfg.get("browser_error_max_html_chars", 16000))
     out_dir = os.path.join(WORKING_DIR, "browser_error_reports")
@@ -3680,8 +5119,20 @@ def create_session(proxy_list: list, user_agent: str,
             keepalive_expiry=15.0,
         ),
     )
+    try:
+        session._visa_proxy_validator_exit_ipv4 = str(validator_exit_ip or "").strip()
+    except Exception:
+        session._visa_proxy_validator_exit_ipv4 = ""
     return session, proxy_raw
-def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int = 0, page_url: str = None, page_action: str = None, enterprise_action: str = None) -> str:
+def solve_recaptcha_v2(
+    proxy_raw: str,
+    user_agent: str,
+    captcha_key_index: int = 0,
+    page_url: str = None,
+    page_action: str = None,
+    enterprise_action: str = None,
+    proxy_egress_ipv4: Optional[str] = None,
+) -> str:
     """
     DUAL-SERVICE CAPTCHA com monitorização completa.
     
@@ -3785,8 +5236,59 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
     capmon_key   = capmon_keys[captcha_key_index % len(capmon_keys)]     if capmon_keys   else None
     capsolver_key= capsolver_keys[captcha_key_index % len(capsolver_keys)] if capsolver_keys else None
 
+    _provider_key_for_balance = {
+        "anti-captcha": anti_key,
+        "2captcha": twocap_key,
+        "capmonster": capmon_key,
+        "capsolver": capsolver_key,
+    }
+    _balance_before: Dict[str, Optional[float]] = {}
+
+    def _log_balance_before(provider: str) -> None:
+        if not _cfg_bool("captcha_log_provider_balance", True):
+            return
+        if provider in _balance_before:
+            return
+        key = _provider_key_for_balance.get(provider)
+        bal = _captcha_balance_sync(provider, key) if key else None
+        _balance_before[provider] = bal
+        if bal is None:
+            logger.info(f"[CaptchaBalance] before {provider}: unavailable")
+        else:
+            logger.info(f"[CaptchaBalance] before {provider}: ${bal:.4f}")
+
+    def _log_balance_after(provider: str) -> None:
+        if not _cfg_bool("captcha_log_provider_balance", True):
+            return
+        key = _provider_key_for_balance.get(provider)
+        after = _captcha_balance_sync(provider, key) if key else None
+        before = _balance_before.get(provider)
+        if after is None:
+            logger.info(f"[CaptchaBalance] after {provider}: unavailable")
+            return
+        if before is None:
+            logger.info(f"[CaptchaBalance] after {provider}: ${after:.4f}")
+            return
+        logger.info(
+            f"[CaptchaBalance] after {provider}: ${after:.4f} "
+            f"(delta={after - before:+.4f})"
+        )
+
     def validate_token(token):
         return bool(token and isinstance(token, str) and len(token) >= 100)
+
+    def _literal_ipv4(tok: Optional[str]) -> Optional[str]:
+        v = str(tok or "").strip()
+        if not v or not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", v):
+            return None
+        parts = []
+        try:
+            parts = [int(x) for x in v.split(".")]
+        except ValueError:
+            return None
+        if any(o < 0 or o > 255 for o in parts):
+            return None
+        return v
 
     # =======================================================================
     # MELHORIA 1.1 + 1.5 — Proxy IP Match no CAPTCHA
@@ -3795,48 +5297,82 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
     # Isso elimina a inconsistencia de IPs que causava falhas de validacao.
     # =======================================================================
     _proxy_task_data = None  # Dados do proxy formatados para a API de CAPTCHA
+    _capsolver_proxy_string = None
+    _proxy_soax_address_candidates: List[str] = []
     if proxy_raw and not _is_direct_proxy(proxy_raw):
-        try:
-            _parsed_proxy = _parse_proxy_raw(proxy_raw)
-            if _parsed_proxy:
-                _ip, _port, _puser, _ppwd = _parsed_proxy
-                _is_literal_ipv4 = bool(
-                    re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", _ip)
-                    and all(0 <= int(octet) <= 255 for octet in _ip.split("."))
+        _parsed_proxy = _parse_proxy_raw(proxy_raw)
+        if not _parsed_proxy:
+            logger.error(
+                "[Captcha] proxy_raw nao parseavel (formato esperado: host:port:user:pass). "
+                "O browser pode usar proxy, mas o solver ficara em proxyless — risco elevado de mismatch IP."
+            )
+        else:
+            _ip, _port, _puser, _ppwd = _parsed_proxy
+            _is_literal_ipv4 = bool(
+                re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", _ip)
+                and all(0 <= int(octet) <= 255 for octet in _ip.split("."))
+            )
+            _require_literal_proxy_ip = _cfg_bool("captcha_require_static_proxy_ip", True)
+            if not _is_literal_ipv4 and _require_literal_proxy_ip:
+                raise RuntimeError(
+                    "Proxy CAPTCHA/browser IP match requires a static proxy IP; "
+                    f"got rotating/superproxy host {_ip}:{_port}. "
+                    "Use webshare_mode='direct' with webshare_fetch_method='api', "
+                    "or set captcha_require_static_proxy_ip = false to pass the same "
+                    "superproxy hostname to the solver (may be rejected by some providers)."
                 )
-                if not _is_literal_ipv4 and _cfg_bool("captcha_require_static_proxy_ip", True):
-                    raise RuntimeError(
-                        "Proxy CAPTCHA/browser IP match requires a static proxy IP; "
-                        f"got rotating/superproxy host {_ip}:{_port}. "
-                        "Use webshare_mode='direct' with webshare_fetch_method='api', "
-                        "or disable captcha_require_static_proxy_ip only for diagnostics."
-                    )
+            if _is_literal_ipv4 or not _require_literal_proxy_ip:
+                _captcha_proxy_type = "http"
+                try:
+                    _configured_scheme = str(
+                        (scraper_settings or {}).get("proxy_scheme") or "http"
+                    ).strip().lower()
+                    if _configured_scheme in ("socks5", "socks5h"):
+                        _captcha_proxy_type = "socks5"
+                except Exception:
+                    pass
+                _proxy_address_for_solver = _ip
+                if not _is_literal_ipv4:
+                    _addr_list = _resolve_hostname_to_ipv4_list(_ip)
+                    if len(_addr_list) > 1:
+                        random.shuffle(_addr_list)
+                    _proxy_soax_address_candidates = list(_addr_list)
+                    if _addr_list:
+                        _proxy_address_for_solver = _addr_list[0]
+                        logger.info(
+                            f"[Captcha] proxyAddress SOAX: {_proxy_address_for_solver} "
+                            f"({len(_addr_list)} IPv4 candidato(s) para Anti-Captcha fallback; host={_ip})"
+                        )
+                    else:
+                        logger.warning(
+                            f"[Captcha] Não foi possível resolver {_ip} — Anti-Captcha pode rejeitar; "
+                            "considere captcha_require_static_proxy_ip=true com IP literal."
+                        )
+                _proxy_task_data = {
+                    "proxyType": _captcha_proxy_type,
+                    "proxyAddress": _proxy_address_for_solver,
+                    "proxyPort": int(_port),
+                    "proxyLogin": _puser,
+                    "proxyPassword": _ppwd,
+                }
+                _capsolver_proxy_string = (
+                    f"{_captcha_proxy_type}:{_proxy_address_for_solver}:{int(_port)}:{_puser}:{_ppwd}"
+                )
                 if _is_literal_ipv4:
-                    _captcha_proxy_type = "http"
-                    try:
-                        _configured_scheme = str(
-                            (scraper_settings or {}).get("proxy_scheme") or "http"
-                        ).strip().lower()
-                        if _configured_scheme in ("socks5", "socks5h"):
-                            _captcha_proxy_type = "socks5"
-                    except Exception:
-                        pass
-                    _proxy_task_data = {
-                        "proxyType": _captcha_proxy_type,
-                        "proxyAddress": _ip,
-                        "proxyPort": int(_port),
-                        "proxyLogin": _puser,
-                        "proxyPassword": _ppwd,
-                    }
-                    logger.info(f"[Captcha] 🔗 Proxy IP Match ativo: {_ip}:{_port}")
+                    logger.info(f"[Captcha] 🔗 Proxy IP Match ativo: {_proxy_address_for_solver}:{_port}")
                 else:
+                    # Expected for SOAX/superproxy: hostname resolves to several edge IPs; we pin the
+                    # first for Anti-Captcha-style proxy payloads. Not a failure — only relevant when
+                    # those providers are actually used for this CAPTCHA step.
                     logger.info(
-                        f"[Captcha] Proxy {_ip}:{_port} e hostname/superproxy; "
-                        "providers como Anti-Captcha exigem IP literal. "
-                        "A task CAPTCHA sera enviada em modo proxyless."
+                        f"[Captcha] SOAX/superproxy: IPv4 efémero {_proxy_address_for_solver}:{_port} "
+                        f"(credenciais = browser; primeiro edge de {_ip}; "
+                        "normal com hostname rotativo)."
                     )
-        except Exception as _pe:
-            logger.warning(f"[Captcha] Nao foi possivel preparar proxy para CAPTCHA: {_pe}")
+    if proxy_raw and not _is_direct_proxy(proxy_raw) and not _proxy_task_data:
+        logger.warning(
+            "[Captcha] Solver em modo proxyless sem proxyAddress — IP do token pode divergir do IP do POST /login."
+        )
     # =======================================================================
 
     def _apply_enterprise_payload(task_data: dict) -> dict:
@@ -3858,7 +5394,10 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
     def _solve_single(provider: str, api_key: str, task_type: str,
                       create_url: str, result_url: str,
                       timeout_budget_s: float,
-                      cancel_event: threading.Event | None = None) -> str | None:
+                      cancel_event: threading.Event | None = None,
+                      override_proxy_ip: Optional[str] = None,
+                      _acf_depth: int = 0,
+                      proxy_task_override: Optional[dict] = None) -> str | None:
         """Resolve CAPTCHA num unico provider e regista estatisticas.
         Usa o mesmo proxy do browser (Proxy IP Match) para evitar detecao por IP diferente.
         """
@@ -3870,20 +5409,53 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             if _time.time() >= local_deadline:
                 logger.warning(f"[Captcha] {provider} ignorado — sem orçamento de tempo restante.")
                 return None
+            _ptd_active = proxy_task_override if proxy_task_override is not None else _proxy_task_data
+            # Vários A-records no superproxy SOAX — Anti-Captcha POPs só alcançam alguns edges.
+            if (
+                proxy_task_override is None
+                and provider == "anti-captcha"
+                and _acf_depth == 0
+                and _proxy_task_data
+                and (_proxy_soax_address_candidates or [])
+                and len(_proxy_soax_address_candidates) > 1
+            ):
+                _seen_try: set[str] = set()
+                for _p_ad in (_proxy_soax_address_candidates[:10]):
+                    if not _p_ad or _p_ad in _seen_try:
+                        continue
+                    _seen_try.add(_p_ad)
+                    _tok = _solve_single(
+                        provider,
+                        api_key,
+                        task_type,
+                        create_url,
+                        result_url,
+                        timeout_budget_s,
+                        cancel_event,
+                        _p_ad,
+                        1,
+                        None,
+                    )
+                    if _tok:
+                        return _tok
+                return None
             # ── Versoes de task com e sem proxy ──────────────────────────────
             # Os providers usam "ProxylessTask" quando nao ha proxy.
             # Com proxy, mudamos para a versao com proxy da task.
-            task_type_with_proxy = task_type.replace("Proxyless", "")
+            task_type_with_proxy = task_type.replace("Proxyless", "").replace("ProxyLess", "")
 
             # Construir payload
             if provider == "anti-captcha":
-                if _proxy_task_data:
-                    # Com proxy: IP do CAPTCHA = IP do browser
+                if _ptd_active:
+                    _td_ant = dict(_ptd_active)
+                    if override_proxy_ip:
+                        _td_ant["proxyAddress"] = override_proxy_ip
+                    # Com proxy: IP do CAPTCHA proximo ao do tunnel (lista SOAX quando existir).
                     task_data = {
                         "type": task_type_with_proxy,
                         "websiteURL": PAGE_URL,
                         "websiteKey": SITE_KEY,
-                        **_proxy_task_data,
+                        **_td_ant,
                     }
                 else:
                     task_data = {"type": task_type, "websiteURL": PAGE_URL, "websiteKey": SITE_KEY}
@@ -3893,12 +5465,12 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                 payload = {"clientKey": api_key, "task": task_data}
 
             elif provider == "2captcha":
-                if _proxy_task_data:
+                if _ptd_active:
                     task_data = {
                         "type": task_type_with_proxy,
                         "websiteURL": PAGE_URL,
                         "websiteKey": SITE_KEY,
-                        **_proxy_task_data,
+                        **_ptd_active,
                     }
                 else:
                     task_data = {"type": task_type, "websiteURL": PAGE_URL, "websiteKey": SITE_KEY}
@@ -3906,12 +5478,12 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                 payload = {"clientKey": api_key, "task": task_data}
 
             elif provider == "capmonster":
-                if _proxy_task_data:
+                if _ptd_active:
                     task_data = {
                         "type": task_type_with_proxy,
                         "websiteURL": PAGE_URL,
                         "websiteKey": SITE_KEY,
-                        **_proxy_task_data,
+                        **_ptd_active,
                     }
                 else:
                     task_data = {"type": task_type, "websiteURL": PAGE_URL, "websiteKey": SITE_KEY}
@@ -3919,16 +5491,35 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                 payload = {"clientKey": api_key, "task": task_data}
 
             else:  # capsolver
-                if _proxy_task_data:
+                _cp_line = None
+                if proxy_task_override and isinstance(proxy_task_override, dict):
+                    try:
+                        ct = str(proxy_task_override.get("proxyType") or "http")
+                        pa = str(proxy_task_override.get("proxyAddress") or "")
+                        pp = int(proxy_task_override.get("proxyPort") or 0)
+                        plog = str(proxy_task_override.get("proxyLogin") or "")
+                        pwd = str(proxy_task_override.get("proxyPassword") or "")
+                        if pa and pp > 0:
+                            _cp_line = f"{ct}:{pa}:{pp}:{plog}:{pwd}"
+                    except Exception:
+                        _cp_line = None
+                if _cp_line:
                     task_data = {
                         "websiteURL": PAGE_URL,
                         "websiteKey": SITE_KEY,
-                        **_proxy_task_data,
+                        "proxy": _cp_line,
+                    }
+                    task_data["type"] = task_type_with_proxy
+                elif _capsolver_proxy_string:
+                    task_data = {
+                        "websiteURL": PAGE_URL,
+                        "websiteKey": SITE_KEY,
+                        "proxy": _capsolver_proxy_string,
                     }
                     task_data["type"] = task_type_with_proxy
                 else:
                     task_data = {"websiteURL": PAGE_URL, "websiteKey": SITE_KEY}
-                    task_data["type"] = task_type
+                    task_data["type"] = task_type.replace("Proxyless", "ProxyLess")
                 if user_agent:
                     task_data["userAgent"] = user_agent
                 _apply_enterprise_payload(task_data)
@@ -3940,8 +5531,43 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                 if cancel_event and cancel_event.is_set():
                     return None
                 resp = client.post(create_url, json=payload)
+                if resp.is_error:
+                    _captcha_record(provider, False, _time.time() - t_start)
+                    captcha_router.record(provider, False, _time.time() - t_start)
+                    _safe_task = {}
+                    try:
+                        _task = dict(payload.get("task") or {})
+                        _safe_task = {
+                            k: v for k, v in _task.items()
+                            if k not in ("proxyLogin", "proxyPassword")
+                        }
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[Captcha] {provider} createTask HTTP {resp.status_code}: "
+                        f"body={resp.text[:500]} task={str(_safe_task)[:500]}"
+                    )
+                    return None
                 resp.raise_for_status()
                 task_resp = resp.json()
+                # Anti-Captcha / 2Captcha / CapMonster: errorId 0 = OK
+                if isinstance(task_resp, dict) and "errorId" in task_resp:
+                    try:
+                        _eid = int(task_resp.get("errorId") or 0)
+                    except (TypeError, ValueError):
+                        _eid = -1
+                    if _eid != 0:
+                        _msg = (
+                            task_resp.get("errorDescription")
+                            or task_resp.get("errorCode")
+                            or task_resp
+                        )
+                        _captcha_record(provider, False, _time.time() - t_start)
+                        logger.warning(
+                            f"[Captcha] {provider} createTask recusou (errorId={task_resp.get('errorId')}): "
+                            f"{str(_msg)[:500]}"
+                        )
+                        return None
 
             task_id = task_resp.get("taskId")
             if not task_id:
@@ -4011,8 +5637,95 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             return None
 
     # ─── FASE 1: DUAL-SERVICE em paralelo (Anti-Captcha + 2Captcha) ─────────────
+    _skip_soax_custom_proxy_solvers = (
+        _page_action == "login"
+        and bool(_proxy_soax_address_candidates)
+        and bool(capmon_key)
+        and _cfg_bool("captcha_skip_soax_custom_proxy_solvers_on_login", True)
+    )
+    if _skip_soax_custom_proxy_solvers:
+        # Deliberate policy (config1.toml: captcha_skip_soax_custom_proxy_solvers_on_login).
+        # External solver DCs rarely complete TCP CONNECT to arbitrary SOAX edge IPs → 403/400 churn.
+        logger.info(
+            "[Captcha] Login SOAX + CapMonster configurado: Anti-Captcha/2Captcha/CapSolver "
+            "não participam nesta corrida por política (`captcha_skip_soax_custom_proxy_solvers_on_login`). "
+            "Motivo habitual: ERROR_PROXY_CONNECT_REFUSED dos workers externos aos IPs edge SOAX "
+            "(não é bug do bot). A resolver só via CapMonster (proxyless) como neste fluxo."
+        )
+
+    # Fase 0 (opcional): CapMonster COM proxyAddress do browser — alinha IP do solve ao POST /login.
+    # createTask pode falhar (CONNECT aos edges SOAX); nesse caso seguimos para proxyless como até aqui.
+    if (
+        _page_action == "login"
+        and _skip_soax_custom_proxy_solvers
+        and capmon_key
+        and _proxy_task_data
+        and _cfg_bool("captcha_soax_try_capmonster_proxy_match_first", True)
+    ):
+        try:
+            _px_try_s = float(
+                (scraper_settings or {}).get(
+                    "captcha_soax_capmonster_proxy_attempt_timeout_sec", 22.0
+                )
+                or 22.0
+            )
+        except Exception:
+            _px_try_s = 22.0
+        _px_try_s = max(12.0, min(50.0, _px_try_s))
+        rb = min(_px_try_s, max(0.0, _global_deadline - _time.time() - 8.0))
+        if rb >= 12:
+            _log_balance_before("capmonster")
+            _base_td = dict(_proxy_task_data)
+            _cm_px_tok = None
+            _eg_vis = _literal_ipv4(proxy_egress_ipv4)
+            if _eg_vis and _cfg_bool(
+                "captcha_soax_try_validator_egress_as_proxy_gateway",
+                True,
+            ):
+                _td_vis = dict(_base_td)
+                _td_vis["proxyAddress"] = _eg_vis
+                logger.info(
+                    "[Captcha] Fase 0a: CapMonster com proxyAddress=ip validado pela sessão "
+                    f"(egress {_eg_vis}; DNS-edge habitual={_base_td.get('proxyAddress')}); "
+                    f"timeout≈{rb:.0f}s."
+                )
+                _cm_px_tok = _solve_single(
+                    "capmonster",
+                    capmon_key,
+                    "RecaptchaV2EnterpriseTaskProxyless",
+                    "https://api.capmonster.cloud/createTask",
+                    "https://api.capmonster.cloud/getTaskResult",
+                    rb,
+                    None,
+                    None,
+                    0,
+                    _td_vis,
+                )
+            if not _cm_px_tok:
+                logger.info(
+                    "[Captcha] Fase 0b: CapMonster proxyAddress=DNS/resolvido habitual "
+                    f"({_base_td.get('proxyAddress')}) — mesmo timeout≈{rb:.0f}s."
+                )
+                _cm_px_tok = _solve_single(
+                    "capmonster",
+                    capmon_key,
+                    "RecaptchaV2EnterpriseTaskProxyless",
+                    "https://api.capmonster.cloud/createTask",
+                    "https://api.capmonster.cloud/getTaskResult",
+                    rb,
+                    None,
+                    None,
+                    0,
+                    None,
+                )
+            if _cm_px_tok:
+                logger.info("[Captcha] ✅ Solved: capmonster (proxy IP match pré-proxyless)")
+                _captcha_record("capmonster", True, 0, winner=True)
+                _log_balance_after("capmonster")
+                return _cm_px_tok
+
     phase1_providers = []
-    if anti_key:
+    if anti_key and not _skip_soax_custom_proxy_solvers:
         phase1_providers.append({
             "provider": "anti-captcha",
             "api_key": anti_key,
@@ -4020,7 +5733,7 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             "create_url": "https://api.anti-captcha.com/createTask",
             "result_url": "https://api.anti-captcha.com/getTaskResult",
         })
-    if twocap_key:
+    if twocap_key and not _skip_soax_custom_proxy_solvers:
         phase1_providers.append({
             "provider": "2captcha",
             "api_key": twocap_key,
@@ -4041,14 +5754,20 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             "create_url": "https://api.capmonster.cloud/createTask",
             "result_url": "https://api.capmonster.cloud/getTaskResult",
         })
-    if parallel_login_backups and capsolver_key:
-        phase1_providers.append({
-            "provider": "capsolver",
-            "api_key": capsolver_key,
-            "task_type": "ReCaptchaV2EnterpriseTaskProxyless",
-            "create_url": "https://api.capsolver.com/createTask",
-            "result_url": "https://api.capsolver.com/getTaskResult",
-        })
+    if parallel_login_backups and capsolver_key and not _skip_soax_custom_proxy_solvers:
+        if _capsolver_proxy_string and _proxy_soax_address_candidates:
+            logger.info(
+                "[Captcha] CapSolver omitido neste login (SOAX + IP edge no payload): "
+                "createTask costuma falhar CONNECT; outros providers da corrida ficam activos."
+            )
+        else:
+            phase1_providers.append({
+                "provider": "capsolver",
+                "api_key": capsolver_key,
+                "task_type": "ReCaptchaV2EnterpriseTaskProxyLess",
+                "create_url": "https://api.capsolver.com/createTask",
+                "result_url": "https://api.capsolver.com/getTaskResult",
+            })
 
     # 3.1 — Reordenar pela performance histórica: o melhor provider vai primeiro
     # Após dados suficientes, o router escolhe o mais rápido com rate >= 80%.
@@ -4060,6 +5779,8 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
     if phase1_providers:
         n = len(phase1_providers)
         logger.info(f"[Captcha] Step 1/2: Race ({', '.join(p['provider'] for p in phase1_providers)}) em paralelo...")
+        for _p in phase1_providers:
+            _log_balance_before(_p["provider"])
         phase1_cancel_event = threading.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=n)
         try:
@@ -4073,7 +5794,9 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
                         else _timeout_secondary_s if p["provider"] == "2captcha"
                         else _timeout_fallback_s
                     ),
-                    phase1_cancel_event
+                    phase1_cancel_event,
+                    None,
+                    0,
                 ): p["provider"]
                 for p in phase1_providers
             }
@@ -4113,6 +5836,8 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             executor.shutdown(wait=False, cancel_futures=True)
 
         if winner_token:
+            if winner_provider:
+                _log_balance_after(winner_provider)
             # Log estatísticas a cada 10 solves (stats legacy + router)
             total_wins = sum(s["wins"] for s in captcha_stats.values())
             if total_wins % 10 == 0:
@@ -4147,16 +5872,21 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
             logger.warning("[Captcha] Sem tempo util restante para CapMonster backup.")
         else:
             logger.info("[Captcha] Step 2/2: CapMonster (backup)...")
+            _log_balance_before("capmonster")
             token = _solve_single(
                 "capmonster", capmon_key,
                 "RecaptchaV2EnterpriseTaskProxyless",
                 "https://api.capmonster.cloud/createTask",
                 "https://api.capmonster.cloud/getTaskResult",
                 min(_timeout_fallback_s, remaining_budget),
+                None,
+                None,
+                0,
             )
             if token:
                 logger.info("[Captcha] ✅ Solved: CapMonster")
                 _captcha_record("capmonster", True, 0, winner=True)
+                _log_balance_after("capmonster")
                 return token
 
     # ─── FASE 3: ÚLTIMO RECURSO — CapSolver ─────────────────────────────────────
@@ -4164,18 +5894,28 @@ def solve_recaptcha_v2(proxy_raw: str, user_agent: str, captcha_key_index: int =
         remaining_budget = _global_deadline - _time.time()
         if remaining_budget <= 5:
             logger.warning("[Captcha] Sem tempo util restante para CapSolver fallback.")
+        elif _capsolver_proxy_string and _proxy_soax_address_candidates:
+            logger.warning(
+                "[Captcha] CapSolver fallback ignorado: proxy SOAX custom já é conhecido "
+                "por falhar connect nos workers CapSolver."
+            )
         else:
             logger.info("[Captcha] Step 3/3: CapSolver (último recurso)...")
+            _log_balance_before("capsolver")
             token = _solve_single(
                 "capsolver", capsolver_key,
-                "ReCaptchaV2EnterpriseTaskProxyless",
+                "ReCaptchaV2EnterpriseTaskProxyLess",
                 "https://api.capsolver.com/createTask",
                 "https://api.capsolver.com/getTaskResult",
                 min(_timeout_fallback_s, remaining_budget),
+                None,
+                None,
+                0,
             )
             if token:
                 logger.info("[Captcha] ✅ Solved: CapSolver")
                 _captcha_record("capsolver", True, 0, winner=True)
+                _log_balance_after("capsolver")
                 return token
 
     # Todos falharam
@@ -4916,7 +6656,15 @@ async def _open_questionario_via_portal_nav(page):
     return False
 
 
-async def playwright_login(username: str, password: str, solve_recaptcha_v2, proxy_raw: str, user_agent: str, captcha_key_index: int = 0):
+async def playwright_login(
+    username: str,
+    password: str,
+    solve_recaptcha_v2,
+    proxy_raw: str,
+    user_agent: str,
+    captcha_key_index: int = 0,
+    proxy_egress_ipv4: Optional[str] = None,
+):
     """
     Enhanced login using Playwright with playwright-stealth for improved CAPTCHA handling and form submission.
     Optimized for heavy load with semaphore-based concurrency control and resource management.
@@ -4928,7 +6676,202 @@ async def playwright_login(username: str, password: str, solve_recaptcha_v2, pro
     login_start_time = time_module.time()
     
     async with _get_playwright_semaphore():
-        return await _playwright_login_internal(username, password, solve_recaptcha_v2, proxy_raw, user_agent, login_start_time, time_module, captcha_key_index)
+        return await _playwright_login_internal(
+            username,
+            password,
+            solve_recaptcha_v2,
+            proxy_raw,
+            user_agent,
+            login_start_time,
+            time_module,
+            captcha_key_index,
+            proxy_egress_ipv4=proxy_egress_ipv4,
+        )
+
+
+async def http_tls_login(username: str, password: str, solve_recaptcha_v2, proxy_raw: str, user_agent: str, captcha_key_index: int = 0):
+    """
+    Non-Playwright login path.
+
+    Uses curl_cffi/TLSClient to establish the MNE session, solve the login
+    reCAPTCHA, and POST the same AJAX fields that the browser sends.
+    This is intentionally limited to the login boundary; downstream form
+    automation is still separate work if the server accepts the login.
+    """
+    import time as time_module
+
+    login_start = time_module.time()
+    language = str((scraper_settings or {}).get("language", "PT") or "PT").strip().upper()
+    if language not in ("PT", "EN"):
+        language = "PT"
+    auth_url = f"{SITE_ORIGIN}/VistosOnline/Authentication.jsp?language={language}"
+    login_url = f"{SITE_ORIGIN}/VistosOnline/login"
+
+    logger.info("[HTTP-TLS] Login engine ativo (sem Playwright/browser).")
+    tls_client = TLSClient(
+        user_agent=user_agent,
+        proxy_raw=None if _is_direct_proxy(proxy_raw) else proxy_raw,
+    )
+    try:
+        preflight = await tls_client.preflight_tls(f"{BASE_URL}/VistosOnline/")
+        logger.info(
+            f"[HTTP-TLS] Preflight: status={preflight.get('status')} "
+            f"cookies={list((preflight.get('cookies') or {}).keys())}"
+        )
+        if int(preflight.get("status") or 0) >= 500:
+            raise RuntimeError(
+                f"[HTTP-TLS] MNE indisponível no preflight: status={preflight.get('status')} "
+                f"text={_short_normalized_text(preflight.get('text') or '')!r}"
+            )
+
+        def _get_auth_page():
+            headers = get_main_headers(user_agent)
+            headers["Referer"] = f"{SITE_ORIGIN}/VistosOnline/"
+            return tls_client.session.get(
+                auth_url,
+                headers=headers,
+                timeout=30,
+                allow_redirects=True,
+            )
+
+        loop = asyncio.get_running_loop()
+        auth_resp = await loop.run_in_executor(None, _get_auth_page)
+        auth_text = _normalize_server_text(getattr(auth_resp, "text", "") or "")
+        logger.info(
+            f"[HTTP-TLS] Authentication.jsp GET: status={auth_resp.status_code} "
+            f"url={getattr(auth_resp, 'url', auth_url)} cookies={list(dict(auth_resp.cookies).keys())}"
+        )
+        if auth_resp.status_code >= 500 or _is_mne_service_unavailable_text(auth_text):
+            raise RuntimeError(
+                f"[HTTP-TLS] Authentication.jsp indisponível: status={auth_resp.status_code} "
+                f"text={_short_normalized_text(auth_text)!r}"
+            )
+        if "Authentication.jsp" not in str(getattr(auth_resp, "url", auth_url)) and auth_resp.status_code in (301, 302, 303, 307, 308):
+            logger.warning(f"[HTTP-TLS] Redirect inesperado ao abrir login: {getattr(auth_resp, 'url', '')}")
+
+        captcha_start = time_module.time()
+        token = solve_recaptcha_v2(
+            proxy_raw,
+            user_agent,
+            captcha_key_index,
+            page_url=auth_url,
+            page_action="login",
+            enterprise_action="LOGIN_EVISA",
+        )
+        captcha_elapsed = time_module.time() - captcha_start
+        if not token or len(str(token)) < 100:
+            raise RuntimeError(f"[HTTP-TLS] CAPTCHA token inválido/curto ({len(str(token or ''))} chars)")
+        logger.info(
+            f"[HTTP-TLS] CAPTCHA token recebido ({len(token)} chars) em {captcha_elapsed:.1f}s."
+        )
+
+        form_data = {
+            "username": username,
+            "password": password,
+            "captchaResponse": token,
+            "language": "PT",
+            "rgpd": "Y",
+        }
+
+        def _post_login():
+            headers = get_login_headers(user_agent)
+            headers["Referer"] = auth_url
+            return tls_client.session.post(
+                login_url,
+                data=form_data,
+                headers=headers,
+                timeout=90,
+                allow_redirects=False,
+            )
+
+        logger.info(
+            "[HTTP-TLS] POST /login direto: "
+            f"user_ok={bool(username)} pass_len={len(password)} captcha_len={len(token)} language=PT rgpd=Y"
+        )
+        login_resp = await loop.run_in_executor(None, _post_login)
+        body_text = _normalize_server_text((getattr(login_resp, "text", "") or "").strip())
+        status_code = int(getattr(login_resp, "status_code", 0) or 0)
+        logger.info(
+            f"[HTTP-TLS] Login response: status={status_code} "
+            f"url={getattr(login_resp, 'url', login_url)} body_len={len(body_text)}"
+        )
+
+        if status_code == 403:
+            raise RuntimeError("HTTP 403 - Proxy/IP Banned")
+        if status_code == 429:
+            raise RuntimeError("Login HTTP 429 — possível bloqueio por taxa / utilizador bloqueado")
+        if status_code >= 500:
+            raise RuntimeError(f"Login falhou com HTTP {status_code}: {_short_normalized_text(body_text)!r}")
+
+        result_data = None
+        if body_text:
+            try:
+                result_data = json.loads(body_text)
+                logger.info(f"[HTTP-TLS] Resposta do servidor (JSON): {result_data}")
+            except Exception:
+                result_data = {"raw": body_text}
+                logger.info(f"[HTTP-TLS] Resposta do servidor (raw): {body_text[:300]}")
+
+        if isinstance(result_data, dict):
+            r_type = str(result_data.get("type", "") or "").lower()
+            r_desc = _normalize_server_text(result_data.get("description", ""))
+            raw_response = _normalize_server_text(str(result_data.get("raw") or ""))
+            if raw_response and (
+                "NewloginForm-d" in raw_response
+                or "Authentication.jsp" in raw_response
+                or "Iniciar Sessão" in raw_response
+                or "Perdeu a sessão" in raw_response
+                or "Session lost" in raw_response
+            ):
+                raise RuntimeError(
+                    "Login rejected/unknown: /login returned authentication or session-lost HTML"
+                )
+            if r_type in ["error", "recaptchaerror", "secblock", "warning", "redirect", "rgpderror"]:
+                logger.error(
+                    f"[HTTP-TLS] SERVIDOR REJEITOU: http={status_code} tipo={r_type}, desc={r_desc}"
+                )
+                raise RuntimeError(f"Login Rejeitado pelo Site: {r_type} - {r_desc}")
+            result_str = str(result_data).lower()
+            if (
+                ("error" in result_str or "invalid" in result_str or "blocked" in result_str or "captcha" in result_str)
+                and not (result_data.get("raw") and len(result_data["raw"]) > 500)
+            ):
+                raise RuntimeError(f"Login possivelmente rejeitado: {result_data}")
+
+        logger.info(
+            f"[HTTP-TLS] Login aceite ou não-rejeitado em {time_module.time() - login_start:.1f}s; "
+            "a validar homepage pós-login."
+        )
+
+        def _get_home_after_login():
+            headers = get_main_headers(user_agent)
+            headers["Referer"] = auth_url
+            return tls_client.session.get(
+                f"{BASE_URL}/VistosOnline/",
+                headers=headers,
+                timeout=45,
+                allow_redirects=True,
+            )
+
+        home_resp = await loop.run_in_executor(None, _get_home_after_login)
+        home_text = _normalize_server_text((getattr(home_resp, "text", "") or "")[:2000])
+        home_url = str(getattr(home_resp, "url", ""))
+        logger.info(
+            f"[HTTP-TLS] Homepage pós-login: status={home_resp.status_code} url={home_url} "
+            f"cookies={list(dict(home_resp.cookies).keys())}"
+        )
+        if "Authentication.jsp" in home_url or "NewloginForm-d" in home_text:
+            raise RuntimeError("HTTP-TLS login não manteve sessão: homepage voltou ao login")
+
+        raise PostLoginFailure(
+            "HTTP-TLS login reached authenticated boundary, but downstream questionnaire/form "
+            "automation is not implemented without Playwright yet."
+        )
+    finally:
+        try:
+            tls_client.close()
+        except Exception:
+            pass
 
 async def _playwright_fill_second_form(page, user_agent: str, proxy_raw: str, captcha_key_index: int, username: str = None) -> bool:
     """
@@ -5657,6 +7600,9 @@ async def _playwright_fill_second_form(page, user_agent: str, proxy_raw: str, ca
 
     async def save_second_form_debug(stage: str):
         """Persist HTML/screenshot when key form values do not stick."""
+        if not _local_debug_artifacts_enabled():
+            logger.debug("[SecondFormDebug] local_debug_artifacts=false; skip %s", stage)
+            return
         try:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             safe_user = (username or "unknown").replace("/", "_").replace("\\", "_")
@@ -7302,17 +9248,18 @@ async def _playwright_fill_second_form(page, user_agent: str, proxy_raw: str, ca
     
     if is_schedule_page:
         logger.info("[Playwright] On schedule page - checking for calendar and slots...")
-        try:
-            _dbg_dir = os.path.join(WORKING_DIR, "debug_html")
-            os.makedirs(_dbg_dir, exist_ok=True)
-            _dbg_ts = time.strftime("%Y%m%d_%H%M%S")
-            _dbg_user = (username or "unknown").replace("/", "_").replace("\\", "_")
-            _dbg_path = os.path.join(_dbg_dir, f"{_dbg_user}_schedule_loaded_{_dbg_ts}.html")
-            with open(_dbg_path, "w", encoding="utf-8") as _dbg_f:
-                _dbg_f.write(await page.content())
-            logger.info("[Debug] Saved schedule page HTML (on load): %s", _dbg_path)
-        except Exception as _dbg_err:
-            logger.warning("[Debug] Could not save schedule_loaded HTML: %s", _dbg_err)
+        if _local_debug_artifacts_enabled():
+            try:
+                _dbg_dir = os.path.join(WORKING_DIR, "debug_html")
+                os.makedirs(_dbg_dir, exist_ok=True)
+                _dbg_ts = time.strftime("%Y%m%d_%H%M%S")
+                _dbg_user = (username or "unknown").replace("/", "_").replace("\\", "_")
+                _dbg_path = os.path.join(_dbg_dir, f"{_dbg_user}_schedule_loaded_{_dbg_ts}.html")
+                with open(_dbg_path, "w", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(await page.content())
+                logger.info("[Debug] Saved schedule page HTML (on load): %s", _dbg_path)
+            except Exception as _dbg_err:
+                logger.warning("[Debug] Could not save schedule_loaded HTML: %s", _dbg_err)
 
         calendar_visible = await page.evaluate("""
             () => {
@@ -7429,17 +9376,18 @@ async def _playwright_fill_second_form(page, user_agent: str, proxy_raw: str, ca
                         logger.info("[Playwright] ✅ Calendar visible after schedule CAPTCHA solve")
                     except Exception:
                         logger.warning("[Playwright] Calendar did not appear after schedule CAPTCHA solve")
-                        try:
-                            _dbg_dir2 = os.path.join(WORKING_DIR, "debug_html")
-                            os.makedirs(_dbg_dir2, exist_ok=True)
-                            _dbg_ts2 = time.strftime("%Y%m%d_%H%M%S")
-                            _dbg_user2 = (username or "unknown").replace("/", "_").replace("\\", "_")
-                            _dbg_path2 = os.path.join(_dbg_dir2, f"{_dbg_user2}_schedule_captcha_still_visible_{_dbg_ts2}.html")
-                            with open(_dbg_path2, "w", encoding="utf-8") as _dbg_f2:
-                                _dbg_f2.write(await page.content())
-                            logger.info("[Debug] Saved schedule page HTML (CAPTCHA still visible): %s", _dbg_path2)
-                        except Exception as _dbg_err2:
-                            logger.warning("[Debug] Could not save schedule_captcha_still_visible HTML: %s", _dbg_err2)
+                        if _local_debug_artifacts_enabled():
+                            try:
+                                _dbg_dir2 = os.path.join(WORKING_DIR, "debug_html")
+                                os.makedirs(_dbg_dir2, exist_ok=True)
+                                _dbg_ts2 = time.strftime("%Y%m%d_%H%M%S")
+                                _dbg_user2 = (username or "unknown").replace("/", "_").replace("\\", "_")
+                                _dbg_path2 = os.path.join(_dbg_dir2, f"{_dbg_user2}_schedule_captcha_still_visible_{_dbg_ts2}.html")
+                                with open(_dbg_path2, "w", encoding="utf-8") as _dbg_f2:
+                                    _dbg_f2.write(await page.content())
+                                logger.info("[Debug] Saved schedule page HTML (CAPTCHA still visible): %s", _dbg_path2)
+                            except Exception as _dbg_err2:
+                                logger.warning("[Debug] Could not save schedule_captcha_still_visible HTML: %s", _dbg_err2)
                 except Exception as _sch_err:
                     logger.error("[Playwright] Error solving schedule page CAPTCHA: %s", _sch_err)
         
@@ -7868,7 +9816,17 @@ async def _playwright_fill_second_form(page, user_agent: str, proxy_raw: str, ca
     
     return False
 
-async def _playwright_login_internal(username: str, password: str, solve_recaptcha_v2, proxy_raw: str, user_agent: str, login_start_time: float, time_module, captcha_key_index: int = 0):
+async def _playwright_login_internal(
+    username: str,
+    password: str,
+    solve_recaptcha_v2,
+    proxy_raw: str,
+    user_agent: str,
+    login_start_time: float,
+    time_module,
+    captcha_key_index: int = 0,
+    proxy_egress_ipv4: Optional[str] = None,
+):
     """
     Internal login implementation with proper resource management.
     """
@@ -7877,6 +9835,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
     _browser_pool_key = (
         f"{DIRECT_PROXY_MARKER}:{username}" if _is_direct_proxy(proxy_raw) else proxy_raw
     )
+    _eg_hint_blk = _egress_ipv4_hint_for_blocking_report(proxy_egress_ipv4)
     await asyncio.sleep(random.uniform(0.5, 1.5))
 
     if _is_direct_proxy(proxy_raw):
@@ -8156,6 +10115,9 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
 
         async def _save_debug_html(label: str):
             """Save current page HTML to debug_html/ folder for inspection."""
+            if not _local_debug_artifacts_enabled():
+                logger.debug(f"[Debug] local_debug_artifacts=false; skip HTML snapshot '{label}'")
+                return
             try:
                 debug_dir = os.path.join(WORKING_DIR, "debug_html")
                 os.makedirs(debug_dir, exist_ok=True)
@@ -8296,7 +10258,12 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             logger.info(f"[BrowserPool] User-Agent reutilizado: {user_agent}")
 
         # --- CORREÇÃO CRÍTICA: INICIAR FUTURES AQUI ---
-        login_response_future = asyncio.Future()
+        # Holder mutável: retentativas de POST /login (erro genérico MNE) criam novo Future.
+        _lr_hold = {"cur": asyncio.Future()}
+
+        def lr_fut() -> asyncio.Future:
+            return _lr_hold["cur"]
+
         login_request_future = asyncio.Future()
         # ----------------------------------------------
 
@@ -8345,8 +10312,8 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             if '/VistosOnline/login' in url and request.method == 'POST':
                 login_post_submitted = True
                 logger.error(f"[Playwright] ❌ Login POST FAILED at network level: {failure} — account may be blocked or proxy issue")
-                if not login_response_future.done():
-                    login_response_future.set_exception(
+                if not lr_fut().done():
+                    lr_fut().set_exception(
                         LoginPostSubmittedFailure(
                             f"Login POST submitted but network failed: {failure}"
                         )
@@ -8384,8 +10351,8 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         
         logger.info(f"[Playwright] Visiting main page to establish session cookies...")
         try:
-            main_page_response = await page.goto(main_page_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_selector("body", timeout=3000)
+            main_page_response = await page.goto(main_page_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_selector("body", state="attached", timeout=8000)
             logger.info(f"[Playwright] Main page loaded (status: {main_page_response.status if main_page_response else 'N/A'})")
             _main_unavailable, _main_title, _main_text = await _page_service_unavailable_snapshot(page)
             if (main_page_response and main_page_response.status >= 500) or _main_unavailable:
@@ -8410,29 +10377,67 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             pass
 
         # Aguardar que o desafio PoW (/ch/v) seja resolvido e os cookies estejam presentes
-        # O servidor define _USER_CONSENT (path /) após o PoW — sem ele o login falha
-        logger.info("[Playwright] Aguardando cookies de sessão completos (_USER_CONSENT PoW)...")
-        for _cw in range(20):  # até 5 segundos; se não vier, seguimos sem bloquear o login
+        # O servidor define _USER_CONSENT (path /) após o PoW — sem ele POST /login costuma cair em /ch/
+        _req_consent = _cfg_bool("login_require_user_consent_before_auth", True)
+        _consent_wait_sec = max(2.0, min(180.0, _cfg_float("login_user_consent_wait_sec", 45.0)))
+        _cw_step_sec = max(0.05, min(2.0, _cfg_float("login_cookie_poll_step_sec", 0.25)))
+        _cw_max_iter = max(4, min(720, int(round(_consent_wait_sec / _cw_step_sec)) + 1))
+        _abort_no_consent = _cfg_bool("login_abort_if_no_user_consent_after_wait", False)
+        logger.info(
+            f"[Playwright] Aguardando cookies de sessão (_USER_CONSENT PoW)... "
+            f"require_consent={_req_consent}, budget_sec={_consent_wait_sec:.0f}"
+        )
+        _cw_logged = -1
+        for _cw in range(_cw_max_iter):
             all_cookies = await context.cookies()
-            cookie_names = [c['name'] for c in all_cookies]
-            has_session = 'cookiesession1' in cookie_names
-            has_consent = any(c['name'] == '_USER_CONSENT' and c['path'] == '/' for c in all_cookies)
-            # Avança se tiver sessão (com ou sem cookie PoW — o Chrome real resolve o PoW automaticamente)
+            cookie_names = [c["name"] for c in all_cookies]
+            has_session = "cookiesession1" in cookie_names
+            has_consent = any(
+                c["name"] == "_USER_CONSENT" and c["path"] == "/" for c in all_cookies
+            )
             if has_session:
+                if not _req_consent:
+                    logger.info(
+                        f"[Playwright] ✅ Sessão pronta (consent opcional): {len(all_cookies)} cookies ({cookie_names})"
+                    )
+                    break
                 if has_consent:
-                    logger.info(f"[Playwright] ✅ Cookies prontos (com PoW): {len(all_cookies)} cookies ({cookie_names})")
-                else:
-                    logger.info(f"[Playwright] ✅ Sessão pronta (sem PoW cookie visível): {len(all_cookies)} cookies ({cookie_names})")
+                    logger.info(
+                        f"[Playwright] ✅ Cookies prontos (com PoW _USER_CONSENT): "
+                        f"{len(all_cookies)} cookies ({cookie_names})"
+                    )
+                    break
+            _log_every = max(4, min(_cw_max_iter, int(round(8.0 / max(_cw_step_sec, 0.05)))))
+            if _cw % _log_every == 0 and _cw != _cw_logged:
+                _cw_logged = _cw
+                logger.info(
+                    f"[Playwright] Aguardando cookies... ({_cw * _cw_step_sec:.1f}s) — "
+                    f"session={has_session}, consent_pow={has_consent}"
+                )
+            try:
+                await page.wait_for_timeout(int(round(_cw_step_sec * 1000)))
+            except Exception:
                 break
-            if _cw % 8 == 0:
-                logger.info(f"[Playwright] Aguardando cookies... ({_cw * 0.25:.1f}s) — session={has_session}, consent_pow={has_consent}")
-            await page.wait_for_timeout(250)
         else:
             all_cookies = await context.cookies()
-            logger.warning(f"[Playwright] ⚠️ Timeout aguardando cookies. Presentes: {[c['name'] for c in all_cookies]}")
-            # Continuar mesmo sem o cookie PoW — o Chrome real deve ter passado o desafio
-            # O cookie pode ter path diferente ou o servidor pode aceitar assim mesmo
-            logger.info("[Playwright] A continuar para login sem cookie PoW — Chrome real deve ter passado o desafio")
+            cookie_names_now = [c["name"] for c in all_cookies]
+            has_cons = any(
+                c["name"] == "_USER_CONSENT" and c["path"] == "/" for c in all_cookies
+            )
+            logger.warning(
+                f"[Playwright] ⚠️ Timeout aguardando cookie PoW. "
+                f"require_consent={_req_consent}, presentes={cookie_names_now}, "
+                f"_USER_CONSENT(path /)={has_cons}"
+            )
+            if _req_consent and _abort_no_consent and "cookiesession1" in cookie_names_now and not has_cons:
+                raise RuntimeError(
+                    "login_abort_if_no_user_consent_after_wait: sessão sem _USER_CONSENT após budget — "
+                    "evitar gastar CAPTCHA em POST que provavelmente devolve /ch/"
+                )
+            logger.info(
+                "[Playwright] A continuar para login apesar do PoW em atraso — "
+                "o servidor pode ainda aceitar (ou falhar depois)."
+            )
 
         logger.info(f"[Playwright] Navigating to login page: {login_url}")
         nav_start_time = time_module.time()
@@ -8444,6 +10449,10 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         captcha_future = None
         captcha_start_time = None
         captcha_ready_time = None
+        # Wall clock when the solver thread returned a token string — best anchor
+        # for “age before POST /login” (Google TTL ~120s from mint; mint is
+        # closer to solver return than to captcha_start_time).
+        captcha_token_received_at = None
         captcha_launch_seq = 0
         captcha_stale_retry_used = False
 
@@ -9006,64 +11015,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             _start_captcha_solver()
         else:
             logger.info("[Playwright] CAPTCHA solving already in progress, awaiting result...")
-        
-        widget_id = None
-        try:
-            widget_info = await page.evaluate("""
-                () => {
-                    const result = {
-                        captchaWidget_defined: false,
-                        captchaWidget_value: null,
-                        widget_id: 0
-                    };
-                    
-                    // Check if captchaWidget is defined
-                    if (typeof window.captchaWidget !== 'undefined' && window.captchaWidget !== null) {
-                        result.captchaWidget_defined = true;
-                        result.captchaWidget_value = window.captchaWidget;
-                        result.widget_id = window.captchaWidget;
-                    } else {
-                        // captchaWidget is not set - this is a problem!
-                        // The website's doLogin function uses grecaptcha.getResponse(captchaWidget)
-                        // If captchaWidget is undefined, it will cause an error
-                        // We need to set it to a valid widget ID
-                        result.captchaWidget_defined = false;
-                        
-                        // Try to find if there's already a widget rendered
-                        // Check if there are any widgets registered
-                        if (window.grecaptcha && window.grecaptcha.getResponse) {
-                            // Default widget ID is 0 for the first widget
-                            result.widget_id = 0;
-                            // Set captchaWidget to 0 if it's not defined
-                            window.captchaWidget = 0;
-                            result.captchaWidget_value = 0;
-                        }
-                    }
-                    
-                    return result;
-                }
-            """)
-            
-            if not widget_info.get('captchaWidget_defined'):
-                logger.warning(f"[Playwright] captchaWidget was not defined, setting it to {widget_info.get('widget_id', 0)}")
-            else:
-                logger.info(f"[Playwright] captchaWidget is defined: {widget_info.get('captchaWidget_value')}")
-            
-            widget_id = widget_info.get('widget_id', 0)
-        except Exception as e:
-            logger.warning(f"[Playwright] Error checking captchaWidget: {e}, defaulting to 0")
-            widget_id = 0
-            try:
-                await page.evaluate("""
-                    () => {
-                        if (typeof window.captchaWidget === 'undefined' || window.captchaWidget === null) {
-                            window.captchaWidget = 0;
-                        }
-                    }
-                """)
-            except Exception:
-                pass
-        
+
         try:
             _stale_threshold = float(
                 (scraper_settings or {}).get("captcha_max_token_age_seconds", 110.0)
@@ -9087,6 +11039,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 else:
                     _captcha_wait_budget = max(5.0, _captcha_safe_limit - 5.0)
                 captcha = await asyncio.wait_for(captcha_future, timeout=_captcha_wait_budget)
+                captcha_token_received_at = time_module.time()
             except asyncio.TimeoutError as e:
                 raise RuntimeError(
                     f"CAPTCHA solving timed out after {_captcha_wait_budget:.1f}s "
@@ -9199,6 +11152,58 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 }
             """)
             logger.info("[Playwright] Mock grecaptcha object created, proceeding with injection")
+
+        widget_id = 0
+        try:
+            _widget_bind_wait = max(1.0, _cfg_float("captcha_widget_binding_wait_sec", 5.0))
+            widget_info = await _await_captcha_widget_binding(
+                page, max_wait_s=_widget_bind_wait, interval_s=0.25
+            )
+            src = str(widget_info.get("source") or "")
+            widget_id = widget_info.get("widget_id", 0)
+            if widget_id is None:
+                widget_id = 0
+
+            if src in ("window.captchaWidget", "data-widget-id", "___grecaptcha_cfg"):
+                logger.info(
+                    f"[Playwright] captchaWidget resolvido ({src}) após token do solver: "
+                    f"{widget_info.get('captchaWidget_value')!r}"
+                )
+            elif src in ("default_0_grecaptcha_ready", "default_0_grecaptcha_object"):
+                logger.info(
+                    "[Playwright] captchaWidget após solver: "
+                    f"fonte={src}; id={widget_id!r}. "
+                    "(Isto apenas alinha JS com o POST; erro de servidor continua "
+                    "visível nos logs/error se o /login falhar.)"
+                )
+            else:
+                logger.warning(
+                    f"[Playwright] captchaWidget incerto após solver e {_widget_bind_wait:.1f}s "
+                    f"(source={src!r}) — forçando id 0 antes da injecção."
+                )
+                await page.evaluate(
+                    """() => {
+                        if (typeof window.captchaWidget === 'undefined'
+                            || window.captchaWidget === null) {
+                            window.captchaWidget = 0;
+                        }
+                    }"""
+                )
+                widget_id = 0
+        except Exception as e:
+            logger.warning(f"[Playwright] Erro ao resolver captchaWidget pós-solver: {e}, defaulting to 0")
+            widget_id = 0
+            try:
+                await page.evaluate(
+                    """() => {
+                        if (typeof window.captchaWidget === 'undefined'
+                            || window.captchaWidget === null) {
+                            window.captchaWidget = 0;
+                        }
+                    }"""
+                )
+            except Exception:
+                pass
 
         logger.info("[Playwright] Injecting solved CAPTCHA token...")
         injection_result = await page.evaluate(
@@ -9674,9 +11679,14 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         submit_button = page.locator('#NewloginForm-d button#loginFormSubmitButton')
         await submit_button.wait_for(state='visible', timeout=10000)
 
-        login_response_future = asyncio.Future()
-        login_request_future = asyncio.Future()
-        
+        _transient_mne_retries_max = max(
+            0, min(8, _cfg_int("login_transient_mne_error_retries", 2))
+        )
+        _max_login_post_attempts = max(1, _transient_mne_retries_max + 1)
+
+        # login_request_future inicializado no início; login response usa `_lr_hold['cur']`
+        # da sessão Playwright — recriável entre retentativas MNE.
+
         time_since_captcha = time_module.time() - captcha_received_time
         total_time = time_module.time() - login_start_time
         logger.info(f"[Playwright] Time since CAPTCHA received: {time_since_captcha:.2f}s")
@@ -9694,12 +11704,15 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
             if '/VistosOnline/login' in url and request.method == 'POST':
                 login_post_submitted = True
                 login_post_network_count += 1
-                if login_post_network_count > 1:
+                if login_post_network_count > _max_login_post_attempts:
                     logger.error(
-                        f"[Playwright] ⚠️ POST /login DUPLICADO detectado pela rede "
-                        f"(total={login_post_network_count}). O botão de login só devia "
-                        "disparar UM POST — investigar causa (double-click, JS submit "
-                        "extra, retry interno)."
+                        f"[Playwright] ⚠️ POST /login DUPLICADO inesperado "
+                        f"(total={login_post_network_count}>{_max_login_post_attempts})."
+                    )
+                elif login_post_network_count > 1:
+                    logger.info(
+                        f"[Playwright] [submit-count] POST /login #{login_post_network_count} "
+                        "(retentativa MNE erro genérico / instabilidade; esperado)."
                     )
                 else:
                     logger.info(
@@ -9723,6 +11736,40 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                             logger.info(f"[Playwright] Login request captured: {url} ({request.method})")
                             if not post_data:
                                 logger.warning(f"[Playwright] Request body is empty!")
+                            else:
+                                from urllib.parse import parse_qs
+                                parsed = parse_qs(post_data, keep_blank_values=True)
+
+                                def _field_info(name: str) -> dict:
+                                    value = (parsed.get(name) or [""])[0] or ""
+                                    digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16] if value else ""
+                                    return {
+                                        "present": name in parsed,
+                                        "len": len(value),
+                                        "sha16": digest,
+                                    }
+
+                                transmitted = {
+                                    key: _field_info(key)
+                                    for key in ("username", "password", "captchaResponse", "language", "rgpd")
+                                }
+                                header_audit = {
+                                    "content_type": request_headers.get("content-type", ""),
+                                    "origin": request_headers.get("origin", ""),
+                                    "referer": request_headers.get("referer", ""),
+                                    "x_requested_with": request_headers.get("x-requested-with", ""),
+                                    "sec_fetch_site": request_headers.get("sec-fetch-site", ""),
+                                    "cookie_has_vistos_sid": "Vistos_sid" in cookie_header,
+                                    "cookie_has_cookiesession1": "cookiesession1" in cookie_header,
+                                }
+                                logger.info(f"[BrowserPOSTAudit] fields={transmitted}")
+                                logger.info(f"[BrowserPOSTAudit] headers={header_audit}")
+                                logger.info(
+                                    "[BrowserPOSTAudit] expected_match: "
+                                    f"user={((parsed.get('username') or [''])[0] == username)} "
+                                    f"pass_len={len((parsed.get('password') or [''])[0]) == len(password)} "
+                                    f"captcha_len={len((parsed.get('captchaResponse') or [''])[0])}"
+                                )
                         except Exception as data_error:
                             logger.warning(f"[Playwright] Could not get POST data from request: {data_error}")
 
@@ -9740,13 +11787,43 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 (response.request and response.request.method == 'POST' and '/VistosOnline/login' in response.request.url)
             )
             
-            if is_login_endpoint and not login_response_future.done():
+            if is_login_endpoint and not lr_fut().done():
                 try:
                     # --- REGRA 1: SE FOR 403, É BANIMENTO IMEDIATO ---
                     if response.status == 403:
-                        logger.error(f"[Playwright] ❌ BANIMENTO TOTAL (403). IP Bloqueado.")
-                        # Define a exceção imediatamente para parar o processo
-                        login_response_future.set_exception(RuntimeError("HTTP 403 - Proxy/IP Banned"))
+                        try:
+                            _post_n = int(login_post_click_count or 0)
+                        except Exception:
+                            _post_n = -1
+                        logger.error(
+                            "[Playwright] ❌ HTTP 403 no POST /login (IP/proxy possivelmente bloqueado). "
+                            f"sequencia_clique={_post_n}"
+                        )
+                        try:
+                            blocking_diagnostics_emit(
+                                phase="mne_http_403_login_response",
+                                username=username,
+                                proxy_raw=proxy_raw,
+                                egress_ipv4_hint=_eg_hint_blk,
+                                http_status=403,
+                                ajax_submit_click_index=login_post_click_count,
+                                network_login_post_count=login_post_network_count,
+                                body_antibot_classification="http_403_edge_or_waf",
+                                extra={
+                                    "handler": "page_on_response_sync",
+                                    "sequencia_clique": _post_n,
+                                    "transient_retry_sequence": bool(_post_n > 1),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        _403_msg = "HTTP 403 - Proxy/IP Banned"
+                        if _post_n > 1:
+                            _403_msg = (
+                                "HTTP 403 - Proxy/IP Banned "
+                                f"({LOGIN_403_MARKER_TRANSIENT_RETRY})"
+                            )
+                        lr_fut().set_exception(RuntimeError(_403_msg))
                         return
                     # ------------------------------------------------
 
@@ -9756,9 +11833,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     if response.status in [301, 302, 303, 307, 308]:
                         location = response.headers.get('location', '')
                         logger.info(f"[Playwright] Login redirect (status {response.status}) to: {location}")
-                        login_response_future.set_result(response)
-                    elif response.status == 403:
-                        login_response_future.set_exception(RuntimeError("HTTP 403 - Proxy/IP Banned"))
+                        lr_fut().set_result(response)
                     else:
                         # The async response handler below reads the AJAX body before
                         # resolving the future. Resolving here races it and loses the
@@ -9910,7 +11985,8 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                 "[Playwright] Fast pre-submit: jQuery/ajax ainda indisponivel; "
                 "vou aguardar uma hidratacao faseada antes de desistir."
             )
-            for hydrate_attempt, hydrate_timeout_ms in enumerate((4000, 6000, 8000), start=1):
+            _hydrate_rounds = (4000, 6000, 8000, 10000, 12000)
+            for hydrate_attempt, hydrate_timeout_ms in enumerate(_hydrate_rounds, start=1):
                 if fast_submit_state.get('jquery_available'):
                     break
 
@@ -9918,11 +11994,17 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     await page.wait_for_function(
                         """
                         () => {
-                            return !!(
+                            const has$ = (
                                 typeof window.$ !== 'undefined' &&
                                 window.$ &&
                                 typeof window.$.ajax === 'function'
                             );
+                            const hasJq = (
+                                typeof window.jQuery !== 'undefined' &&
+                                window.jQuery &&
+                                typeof window.jQuery.ajax === 'function'
+                            );
+                            return !!(has$ || hasJq);
                         }
                         """,
                         timeout=hydrate_timeout_ms,
@@ -9957,7 +12039,10 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                             }
 
                             return {
-                                jquery_available: !!(typeof window.$ !== 'undefined' && window.$ && typeof window.$.ajax === 'function'),
+                                jquery_available: !!(
+                                    (typeof window.$ !== 'undefined' && window.$ && typeof window.$.ajax === 'function') ||
+                                    (typeof window.jQuery !== 'undefined' && window.jQuery && typeof window.jQuery.ajax === 'function')
+                                ),
                                 submit_button_exists: !!submitButton,
                                 submit_button_visible: !!(submitButton && submitButton.offsetParent !== null),
                                 submit_button_enabled: !!(submitButton && !submitButton.disabled),
@@ -9974,7 +12059,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     )
                     fast_submit_state.update(hydrate_state or {})
                     logger.info(
-                        f"[Playwright] Fast pre-submit recheck {hydrate_attempt}/3: "
+                        f"[Playwright] Fast pre-submit recheck {hydrate_attempt}/{len(_hydrate_rounds)}: "
                         f"jquery={fast_submit_state.get('jquery_available')} "
                         f"captcha_len={fast_submit_state.get('token_length', 0)} "
                         f"button_visible={fast_submit_state.get('submit_button_visible')} "
@@ -9983,7 +12068,7 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
                     )
                 except Exception as hydrate_err:
                     logger.warning(
-                        f"[Playwright] Fast pre-submit recheck {hydrate_attempt}/3 falhou: {hydrate_err}"
+                        f"[Playwright] Fast pre-submit recheck {hydrate_attempt}/{len(_hydrate_rounds)} falhou: {hydrate_err}"
                     )
 
         fast_errors = fast_submit_state.get('errors', [])
@@ -10014,76 +12099,330 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         logger.info("[Playwright] Injecting hook to capture login AJAX response...")
         await page.evaluate("""
             () => {
-                // Hook into jQuery AJAX to capture login response
-                // This will intercept the AJAX call made by doLogin
-                if (typeof $ !== 'undefined' && typeof $.ajax === 'function') {
-                    const originalAjax = $.ajax;
-                    $.ajax = function(options) {
-                        // Check if this is the login request
-                        if (options.url && options.url.includes('/VistosOnline/login')) {
+                window._lastLoginChallengeDelegateDone = false;
+                /* Respostas a /login feitas só com XHR/fetch nativo (p.ex. código em /ch/bd.js)
+                   não passam pelo jQuery.ajax monkey-patch — isto garante que o polling Python
+                   vê JSON quando o backend o devolve num 2º request. */
+                try {
+                    if (!window.__mneNativeLoginSinkInstalled) {
+                        window.__mneNativeLoginSinkInstalled = true;
+                        const sinkLoginText = (txt) => {
+                            try {
+                                const s = txt || '';
+                                if (!s) {
+                                    return;
+                                }
+                                window._lastLoginRaw = s;
+                                const t = s.trim();
+                                if (t.startsWith('{') || t.startsWith('[')) {
+                                    try {
+                                        const j = JSON.parse(t);
+                                        if (j && typeof j === 'object' && String(j.type || '').trim()) {
+                                            window._lastLoginResult = j;
+                                            window._lastLoginResultType = j.type || '';
+                                            window._lastLoginResultDesc = j.description || '';
+                                        }
+                                    } catch (_p) {}
+                                }
+                            } catch (_e) {}
+                        };
+                        const xo = XMLHttpRequest.prototype.open;
+                        const xs = XMLHttpRequest.prototype.send;
+                        XMLHttpRequest.prototype.open = function (method, url) {
+                            try {
+                                this.__mneUrl = typeof url === 'string' ? url : String(url || '');
+                            } catch (_u) {
+                                this.__mneUrl = '';
+                            }
+                            return xo.apply(this, arguments);
+                        };
+                        XMLHttpRequest.prototype.send = function (...args) {
+                            const xhr = this;
+                            try {
+                                const u = String(xhr.__mneUrl || '');
+                                if (u.indexOf('/VistosOnline/login') !== -1) {
+                                    xhr.addEventListener(
+                                        'loadend',
+                                        function () {
+                                            try {
+                                                sinkLoginText(xhr.responseText || '');
+                                            } catch (_l) {}
+                                        },
+                                        { once: true },
+                                    );
+                                }
+                            } catch (_s) {}
+                            return xs.apply(this, args);
+                        };
+                        if (typeof fetch === 'function' && !window.__mneFetchLoginHooked) {
+                            window.__mneFetchLoginHooked = true;
+                            const OF = fetch;
+                            window.fetch = function () {
+                                let u = '';
+                                try {
+                                    const input = arguments[0];
+                                    u = typeof input === 'string'
+                                        ? input
+                                        : (input && input.url) ? String(input.url) : '';
+                                } catch (_f) {
+                                    u = '';
+                                }
+                                const p = OF.apply(this, arguments);
+                                if (u.indexOf('/VistosOnline/login') === -1) {
+                                    return p;
+                                }
+                                return p.then((res) => {
+                                    try {
+                                        return res.clone().text().then((txt) => {
+                                            sinkLoginText(txt);
+                                            return res;
+                                        }).catch(() => res);
+                                    } catch (_c) {
+                                        return res;
+                                    }
+                                });
+                            };
+                        }
+                    }
+                } catch (_nativeSink) {}
+
+                const candidates = [];
+                if (typeof jQuery !== 'undefined' && jQuery && typeof jQuery.ajax === 'function') {
+                    candidates.push(jQuery);
+                }
+                if (typeof $ !== 'undefined' && $ && typeof $.ajax === 'function') {
+                    candidates.push($);
+                }
+                candidates.forEach((jqRef) => {
+                    if (!jqRef || jqRef.__mneLoginAjaxHookInstalled) {
+                        return;
+                    }
+                    jqRef.__mneLoginAjaxHookInstalled = true;
+                    if (typeof jqRef.ajaxPrefilter === 'function') {
+                        jqRef.ajaxPrefilter(function(options) {
+                            try {
+                                const u = options && options.url ? String(options.url) : '';
+                                if (u.indexOf('/VistosOnline/login') !== -1) {
+                                    options.dataType = 'text';
+                                    if (typeof options.accepts !== 'undefined') {
+                                        try {
+                                            delete options.accepts.json;
+                                        } catch (_a) {}
+                                    }
+                                }
+                            } catch (_e1) {}
+                        });
+                    }
+                    const originalAjax = jqRef.ajax.bind(jqRef);
+                    jqRef.ajax = function(options) {
+                        const url = (options && options.url) ? String(options.url) : '';
+                        if (url.includes('/VistosOnline/login')) {
                             const originalSuccess = options.success;
                             const originalError = options.error;
+                            const originalComplete = options.complete;
+
+                            const _challengeRaw = (text) => {
+                                const s = text || '';
+                                return s.includes('/ch/bd.js')
+                                    || (s.includes('/ch/') && s.includes('<script'));
+                            };
+
+                            const _kickChallengeScriptsSync = (html) => {
+                                try {
+                                    const hm = typeof html === 'string' ? html : '';
+                                    if (!_challengeRaw(hm)) {
+                                        return;
+                                    }
+                                    const base = window.location.origin || '';
+                                    const bdAbs = base + '/ch/bd.js';
+                                    let bdPresent = false;
+                                    try {
+                                        bdPresent = !!document.querySelector('script[src*="/ch/bd.js"]');
+                                    } catch (_q) {}
+                                    if (!bdPresent) {
+                                        const bd = document.createElement('script');
+                                        bd.src = bdAbs;
+                                        (document.head || document.documentElement).appendChild(bd);
+                                    }
+                                    const div = document.createElement('div');
+                                    div.innerHTML = hm.slice(0, 150000);
+                                    const scripts = Array.from(div.querySelectorAll('script'));
+                                    for (const s of scripts) {
+                                        const srcAttr = s.getAttribute('src');
+                                        if (srcAttr && srcAttr.indexOf('bd.js') !== -1) {
+                                            continue;
+                                        }
+                                        const ne = document.createElement('script');
+                                        if (srcAttr) {
+                                            try {
+                                                ne.src = new URL(srcAttr, window.location.href).href;
+                                            } catch (_e7) {
+                                                ne.src = srcAttr;
+                                            }
+                                        }
+                                        const inline = (s.textContent || s.innerHTML || '');
+                                        if (inline) {
+                                            ne.textContent = inline;
+                                        }
+                                        if (ne.src || ne.textContent) {
+                                            (document.body || document.documentElement).appendChild(ne);
+                                        }
+                                    }
+                                    window.__mneAntibotKickSeq =
+                                        (window.__mneAntibotKickSeq || 0) + 1;
+                                } catch (_e6) {}
+                            };
+
+                            options.complete = function(jqXHR, textStatus) {
+                                try {
+                                    const raw = (jqXHR && jqXHR.responseText) ? jqXHR.responseText : '';
+                                    if (raw) {
+                                        window._lastLoginRaw = raw;
+                                    }
+                                    const st = textStatus || '';
+                                    const httpOk = jqXHR && (
+                                        jqXHR.status === 200 || jqXHR.status === 304 || jqXHR.status === 0
+                                    );
+                                    // dataType: 'json' + HTML => parsererror/error; sem success().
+                                    const needDelegate = _challengeRaw(raw)
+                                        && typeof originalSuccess === 'function'
+                                        && httpOk
+                                        && (st === 'parsererror' || st === 'error')
+                                        && !window._lastLoginChallengeDelegateDone;
+                                    if (needDelegate) {
+                                        window._lastLoginChallengeDelegateDone = true;
+                                        window._lastLoginAjaxSeen = true;
+                                        window._lastLoginAjaxAntibotDelegated = true;
+                                        window._lastLoginAjaxSuccess = true;
+                                        window._lastLoginAjaxError = false;
+                                        window._loginAjaxOriginalSuccessSuppressed = false;
+                                        const ctx =
+                                            options.context != null ? options.context : jqXHR;
+                                        _kickChallengeScriptsSync(raw);
+                                        const delayedRun = () => {
+                                            try {
+                                                originalSuccess.call(ctx, raw, 'success', jqXHR);
+                                            } catch (_e9) {}
+                                        };
+                                        setTimeout(delayedRun, 2200);
+                                    }
+                                } catch (e) {
+                                    console.warn('[Hook] login complete hook:', e);
+                                }
+                                if (typeof originalComplete === 'function') {
+                                    return originalComplete.apply(this, arguments);
+                                }
+                            };
+
                             options.success = function(data, textStatus, jqXHR) {
                                 try {
-                                    // Store the result for later retrieval
-                                    let resultObj = null;
                                     window._lastLoginAjaxSeen = true;
                                     window._lastLoginAjaxSuccess = true;
                                     window._lastLoginAjaxStatus = jqXHR ? jqXHR.status : null;
                                     window._lastLoginAjaxTextStatus = textStatus || '';
-                                    window._lastLoginRaw = (typeof data === 'string') ? data : JSON.stringify(data || null);
+                                    window._lastLoginRaw = (typeof data === 'string')
+                                        ? data
+                                        : JSON.stringify(data || null);
+                                    const rawStr = (typeof data === 'string') ? data : '';
+                                    const challenge = _challengeRaw(rawStr);
+                                    if (challenge) {
+                                        window._lastLoginChallengeDelegateDone = true;
+                                        window._lastLoginAjaxAntibotDelegated = true;
+                                        window._loginAjaxOriginalSuccessSuppressed = false;
+                                        _kickChallengeScriptsSync(rawStr);
+                                        if (typeof originalSuccess === 'function') {
+                                            const ctx =
+                                                options.context != null ? options.context : this;
+                                            const delayedRun = () => {
+                                                try {
+                                                    originalSuccess.call(
+                                                        ctx, data, textStatus, jqXHR,
+                                                    );
+                                                } catch (_e8) {}
+                                            };
+                                            // bd.js corre em async; handlers MNE esperam o challenge.
+                                            setTimeout(delayedRun, 2200);
+                                            return undefined;
+                                        }
+                                        return undefined;
+                                    }
+
+                                    let resultObj = null;
                                     if (typeof data === 'string') {
                                         resultObj = JSON.parse(data);
-                                    } else if (typeof data === 'object') {
+                                    } else if (typeof data === 'object' && data !== null) {
                                         resultObj = data;
                                     }
-                                    
+
                                     if (resultObj) {
                                         window._lastLoginResult = resultObj;
                                         window._lastLoginResultType = resultObj.type || 'unknown';
                                         window._lastLoginResultDesc = resultObj.description || 'N/A';
-                                        console.log('[Hook] Login AJAX success intercepted - type:', resultObj.type, 'description:', resultObj.description);
+                                        console.log(
+                                            '[Hook] Login AJAX success intercepted - type:',
+                                            resultObj.type,
+                                            'description:',
+                                            resultObj.description
+                                        );
                                     }
                                 } catch (e) {
                                     console.warn('[Hook] Failed to parse login AJAX result:', e);
                                 }
 
-                                // Do NOT call the site's original success callback here.
-                                // That callback immediately calls location.reload(), which
-                                // destroys these captured variables before Playwright can
-                                // inspect the real login result.
-                                window._loginAjaxOriginalSuccessSuppressed = true;
+                                // Re-emit para o código MNE (redirects / fluxo pos-login / retentativas).
+                                if (typeof originalSuccess === 'function') {
+                                    window._loginAjaxOriginalSuccessSuppressed = false;
+                                    const ctx =
+                                        options.context != null ? options.context : this;
+                                    const _data = arguments[0];
+                                    const _ts = arguments[1];
+                                    const _xhr = arguments[2];
+                                    setTimeout(() => {
+                                        try {
+                                            originalSuccess.call(ctx, _data, _ts, _xhr);
+                                        } catch (_eOs) {}
+                                    }, 0);
+                                } else {
+                                    window._loginAjaxOriginalSuccessSuppressed = true;
+                                }
                                 return undefined;
                             };
                             options.error = function(jqXHR, textStatus, errorThrown) {
                                 try {
                                     window._lastLoginAjaxSeen = true;
-                                    window._lastLoginAjaxError = true;
+                                    const raw = jqXHR && jqXHR.responseText ? jqXHR.responseText : '';
+                                    if (raw) {
+                                        window._lastLoginRaw = raw;
+                                    }
+                                    const isParser = textStatus === 'parsererror';
+                                    const ch = _challengeRaw(raw);
+                                    if (!(isParser && ch)) {
+                                        window._lastLoginAjaxError = true;
+                                    }
                                     window._lastLoginAjaxStatus = jqXHR ? jqXHR.status : null;
                                     window._lastLoginAjaxTextStatus = textStatus || '';
                                     window._lastLoginAjaxErrorThrown = errorThrown ? String(errorThrown) : '';
-                                    window._lastLoginRaw = jqXHR && jqXHR.responseText ? jqXHR.responseText : '';
-                                    console.warn('[Hook] Login AJAX error intercepted - status:', window._lastLoginAjaxStatus, 'textStatus:', textStatus);
+                                    console.warn(
+                                        '[Hook] Login AJAX error intercepted - status:',
+                                        window._lastLoginAjaxStatus,
+                                        'textStatus:',
+                                        textStatus
+                                    );
                                 } catch (e) {
                                     console.warn('[Hook] Failed to capture login AJAX error:', e);
                                 }
-                                // Same as success: avoid site alert/reload side effects until
-                                // Python has recorded the actual error state.
                                 window._loginAjaxOriginalErrorSuppressed = true;
                                 return undefined;
                             };
                         }
-                        // Call original ajax
-                        return originalAjax.apply(this, arguments);
+                        return originalAjax.apply(jqRef, arguments);
                     };
-                    console.log('[Hook] jQuery AJAX hook installed');
-                } else {
-                    console.log('[Hook] jQuery not available yet, hook will be installed when jQuery loads');
-                }
+                    console.log('[Hook] jQuery AJAX hook installed on', jqRef === window.jQuery ? 'jQuery' : '$');
+                });
             }
         """)
-        
-             # --- PREPARAÇÃO DO CLIQUE (ASSINATURA DIGITAL PERFEITA) ---
+
+        # --- PREPARAÇÃO DO CLIQUE (ASSINATURA DIGITAL PERFEITA) ---
         # Baseado na captura F12: Headers EXATOS que o site espera.
         
         # 1. Interceptador do POST /login
@@ -10188,334 +12527,892 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         # 5. Configura Captura de Resposta AJAX
         async def handle_login_response(response):
             try:
-                if '/VistosOnline/login' in response.url and response.request.method == 'POST':
-                    if not login_response_future.done():
-                        # Banimento Imediato
-                        if response.status == 403:
-                            login_response_future.set_exception(RuntimeError("HTTP 403 - Proxy Banned"))
-                            return
-                        
-                        # Salva corpo
+                url_part = response.url or ""
+                if '/VistosOnline/login' not in url_part:
+                    return
+                try:
+                    rq = response.request
+                    meth = ((getattr(rq, "method", None) or "") or "").strip().upper()
+                except Exception:
+                    meth = ""
+                # Alguns browsers/rotas Puppeteer devolvem method vazio; não descartar o evento AJAX.
+                if meth and meth not in ("POST",):
+                    return
+                if meth == "":
+                    logger.debug(
+                        "[Playwright] Login /login response with empty HTTP method in Playwright; "
+                        "accepting as AJAX candidate."
+                    )
+                if not lr_fut().done():
+                    # Banimento Imediato (401/503 etc. diferentes)
+                    if response.status == 403:
                         try:
-                            body = _normalize_server_text(await response.text())
+                            _ajax_n = int(login_post_click_count or 0)
+                        except Exception:
+                            _ajax_n = -1
+                        logger.error(
+                            "[Playwright] HTTP 403 no /login (handler AJAX rede). "
+                            f"sequencia_clique≈{_ajax_n}"
+                        )
+                        try:
+                            if _cfg_bool("login_antibot_diagnostic_bundle", True):
+                                _b403 = ""
+                                try:
+                                    _b403 = _normalize_server_text(await response.text())
+                                except Exception:
+                                    pass
+                                _d403 = _mne_build_antibot_diagnostic_payload(
+                                    response,
+                                    _b403,
+                                    username=username,
+                                    ajax_click_sequence=login_post_click_count,
+                                )
+                                _d403["http_403_blocking_note"] = (
+                                    "HTTP 403 típico de IP/proxy negado antes do corpo JSON de login;"
+                                    " perímetro forte."
+                                )
+                                logger.info(
+                                    "[AntibotDiagnostic] "
+                                    + json.dumps(_d403, ensure_ascii=False, default=str)
+                                )
+                        except Exception:
+                            pass
+                        try:
+                            blocking_diagnostics_emit(
+                                phase="mne_http_403_login_response",
+                                username=username,
+                                proxy_raw=proxy_raw,
+                                egress_ipv4_hint=_eg_hint_blk,
+                                http_status=403,
+                                ajax_submit_click_index=login_post_click_count,
+                                network_login_post_count=login_post_network_count,
+                                body_antibot_classification="http_403_edge_or_waf",
+                                extra={
+                                    "handler": "ajax_network_response_async",
+                                    "sequencia_clique": _ajax_n,
+                                    "transient_retry_sequence": bool(_ajax_n > 1),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        _403_msg_ajax = "HTTP 403 - Proxy/IP Banned"
+                        if _ajax_n > 1:
+                            _403_msg_ajax = (
+                                "HTTP 403 - Proxy/IP Banned "
+                                f"({LOGIN_403_MARKER_TRANSIENT_RETRY})"
+                            )
+                        lr_fut().set_exception(RuntimeError(_403_msg_ajax))
+                        return
+
+                    # Salva corpo
+                    try:
+                        body = _normalize_server_text(await response.text())
+                        try:
+                            page._login_result = json.loads(body)
+                        except Exception:
+                            page._login_result = {"raw": body}
+                        try:
+                            if _cfg_bool("login_antibot_diagnostic_bundle", True):
+                                _diag = _mne_build_antibot_diagnostic_payload(
+                                    response,
+                                    body,
+                                    username=username,
+                                    ajax_click_sequence=login_post_click_count,
+                                )
+                                logger.info(
+                                    "[AntibotDiagnostic] "
+                                    + json.dumps(_diag, ensure_ascii=False, default=str)
+                                )
+                        except Exception as _diag_ex:
+                            logger.debug(
+                                f"[AntibotDiagnostic] omitido (erro de montagem/log): {_diag_ex}"
+                            )
+                        # Desafio /ch/: começar bd.js antes de libertar lr_fut() —
+                        # dá tempo ao JS enquanto o fluxo principal ainda faz await lr_fut().
+                        if _is_mne_login_antibot_challenge_html(body):
                             try:
-                                page._login_result = json.loads(body)
-                            except:
-                                page._login_result = {"raw": body}
-                            login_response_future.set_result(response)
-                            logger.info(f"[Playwright] ✅ Resposta AJAX Capturada: Status {response.status}")
-                        except Exception as e:
-                            logger.warning(f"[Playwright] Erro ao ler resposta: {e}")
-                            try:
-                                page._login_result = None
-                                page._login_body_read_error = str(e)
+                                logger.info(
+                                    "[Playwright] Desafio /ch/ na resposta; "
+                                    "injeção antecipada (antes do await lr_fut no worker principal)."
+                                )
+                                await _mne_inject_antibot_scripts_from_login_html(
+                                    page, body
+                                )
+                                try:
+                                    page._mne_login_challenge_early_inject_done = True
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
-                            if not login_response_future.done():
-                                login_response_future.set_result(response)
+                        lr_fut().set_result(response)
+                        logger.info(f"[Playwright] ✅ Resposta AJAX Capturada: Status {response.status}")
+                    except Exception as e:
+                        logger.warning(f"[Playwright] Erro ao ler resposta: {e}")
+                        try:
+                            page._login_result = None
+                            page._login_body_read_error = str(e)
+                        except Exception:
+                            pass
+                        if not lr_fut().done():
+                            lr_fut().set_result(response)
+                else:
+                    # Primeira resposta (HTML /ch/bd.js) já resolveu lr_fut(); o JS antibot pode
+                    # disparar um 2º POST /login — antes este handler ignorava porque lr_fut().done().
+                    try:
+                        if response.status != 200:
+                            return
+                        _fol_body = _normalize_server_text(await response.text())
+                    except Exception:
+                        return
+                    if not (
+                        isinstance(_fol_body, str)
+                        and _fol_body.strip().startswith("{")
+                        and '"type"' in _fol_body
+                    ):
+                        return
+                    try:
+                        _fol_j = json.loads(_fol_body)
+                    except Exception:
+                        return
+                    if not isinstance(_fol_j, dict) or not str(_fol_j.get("type") or "").strip():
+                        return
+                    try:
+                        _payload = json.dumps(_fol_j, ensure_ascii=False)
+                        await page.evaluate(
+                            """(txt) => {
+                                try {
+                                    window._lastLoginRaw = txt;
+                                    const j = JSON.parse(txt);
+                                    if (j && typeof j === 'object' && String(j.type || '').trim()) {
+                                        window._lastLoginResult = j;
+                                        window._lastLoginResultType = String(j.type || '');
+                                        window._lastLoginResultDesc = String(j.description || '');
+                                        window._lastLoginAjaxSeen = true;
+                                    }
+                                } catch (_e) {}
+                            }""",
+                            _payload,
+                        )
+                        try:
+                            page._login_result = _fol_j
+                        except Exception:
+                            pass
+                        logger.info(
+                            "[Playwright] Resposta POST /login suplementar (pós-/ch/) "
+                            f"type={str(_fol_j.get('type'))!r} encaminhada para o sink em página."
+                        )
+                    except Exception as _fol_ex:
+                        logger.debug(
+                            "[Playwright] falha ao encaminhar JSON suplementar de /login: "
+                            f"{_fol_ex}"
+                        )
             except Exception:
                 pass
 
         page.on("response", handle_login_response)
 
-        # 6.0. Guard de token CAPTCHA expirado.
-        # reCAPTCHA tokens só são válidos 120s a contar do momento em que a
-        # Google os emite (e isso acontece DURANTE o solve, não no fim). Se
-        # o solver demorou tanto que mesmo somando o tempo até aqui o token
-        # já passou ~115s, abortamos antes de gastar o POST /login. Sem
-        # isto, o MNE devolve a mensagem genérica "Foi encontrado um erro
-        # ao executar a operação." (ver doLogin AjaxFailed), que parece um
-        # bloqueio de proxy mas é só o token caducado — foi exactamente o
-        # que aconteceu no log de 06:57:55→07:01:25 (181s de solve + 30s
-        # de overhead → token com >210s antes do POST, rejeição imediata).
-        try:
-            _stale_threshold = float(
-                (scraper_settings or {}).get("captcha_max_token_age_seconds", 110.0)
-            )
-        except Exception:
-            _stale_threshold = 110.0
-        try:
-            _real_age = time_module.time() - (captcha_start_time or time_module.time())
-        except Exception:
-            _real_age = 0.0
-        if _real_age >= _stale_threshold:
-            logger.error(
-                f"[Playwright] ⛔ Abortando POST /login — token CAPTCHA tem "
-                f"{_real_age:.1f}s (limite {_stale_threshold:.0f}s, TTL Google 120s). "
-                "Submeter agora seria gastar a tentativa para nada e penalizar o proxy."
-            )
-            raise CaptchaTokenExpired(
-                f"reCAPTCHA token age {_real_age:.1f}s exceeds safe limit "
-                f"{_stale_threshold:.0f}s (Google TTL 120s); solver too slow"
-            )
-
-        # 6. O CLIQUE REAL (O navegador gera o restante dos headers automaticamente)
-        # GUARDA: só permitimos um único click. Se por qualquer razão este bloco
-        # for re-entrado (não devia, mas auditamos), abortamos antes de fazer
-        # outro POST /login.
-        if login_post_click_count > 0:
-            logger.error(
-                f"[Playwright] ⛔ Tentativa de re-clicar o botão de login "
-                f"(clicks_anteriores={login_post_click_count}). Abortando para "
-                "não duplicar POST /login."
-            )
-            raise LoginPostSubmittedFailure(
-                f"Login submit click already performed {login_post_click_count} time(s); "
-                "refusing duplicate click."
-            )
-        login_post_click_count += 1
-        logger.info(
-            f"[Playwright] [submit-count] Click #{login_post_click_count} no botão de login "
-            "(esperado: exactamente 1 click → 1 POST /login)."
-        )
-        await submit_button.click(delay=random.randint(20, 40))
-        logger.info(
-            f"[Playwright] [submit-count] Click #{login_post_click_count} concluído. "
-            "Aguardando POST /login na rede..."
-        )
-        
-        # 7. Processa o resultado
-        try:
-            login_response = await asyncio.wait_for(login_response_future, timeout=30.0)
-            login_http_status = getattr(login_response, "status", None)
-
-            # Ler o body da resposta capturada
-            result_data = None
-            body_text = ""
+        transient_mne_attempts_used = 0
+        while True:
+            # 6.0. Guard de token CAPTCHA expirado.
+            # reCAPTCHA tokens só são válidos 120s a contar do momento em que a
+            # Google os emite (e isso acontece DURANTE o solve, não no fim). Se
+            # o solver demorou tanto que mesmo somando o tempo até aqui o token
+            # já passou ~115s, abortamos antes de gastar o POST /login. Sem
+            # isto, o MNE devolve a mensagem genérica "Foi encontrado um erro
+            # ao executar a operação." (ver doLogin AjaxFailed), que parece um
+            # bloqueio de proxy mas é só o token caducado — foi exactamente o
+            # que aconteceu no log de 06:57:55→07:01:25 (181s de solve + 30s
+            # de overhead → token com >210s antes do POST, rejeição imediata).
             try:
-                body_bytes = await login_response.body()
-                body_text  = _normalize_server_text(
-                    body_bytes.decode('utf-8', errors='replace').strip()
+                _stale_threshold = float(
+                    (scraper_settings or {}).get("captcha_max_token_age_seconds", 110.0)
                 )
-                if body_text:
-                    try:
-                        result_data = json.loads(body_text)
-                        logger.info(f"[Playwright] 📋 Resposta do servidor (JSON): {result_data}")
-                    except json.JSONDecodeError:
-                        # Nao e JSON — pode ser HTML de redirect ou mensagem simples
-                        result_data = {"raw": body_text}
-                        logger.info(f"[Playwright] 📋 Resposta do servidor (raw): {body_text[:300]}")
-                else:
-                    logger.info("[Playwright] 📋 Resposta vazia — provavelmente redirect imediato (OK)")
-            except Exception as _body_err:
-                logger.warning(f"[Playwright] Nao foi possivel ler body da resposta: {_body_err}")
-
-            if result_data is None:
-                captured_result = getattr(page, "_login_result", None)
-                if captured_result:
-                    result_data = captured_result
-                    logger.info(f"[Playwright] 📋 Resposta AJAX recuperada do handler: {result_data}")
-
-            if result_data is None:
-                ajax_state = {}
-                for ajax_wait in range(24):
-                    try:
-                        ajax_state = await page.evaluate("""
-                            () => {
-                                const raw = window._lastLoginRaw || '';
-                                let parsed = window._lastLoginResult || null;
-                                if (!parsed && raw) {
-                                    try { parsed = JSON.parse(raw); } catch (e) {}
-                                }
-                                return {
-                                    seen: !!window._lastLoginAjaxSeen,
-                                    error: !!window._lastLoginAjaxError,
-                                    status: window._lastLoginAjaxStatus || null,
-                                    textStatus: window._lastLoginAjaxTextStatus || '',
-                                    errorThrown: window._lastLoginAjaxErrorThrown || '',
-                                    success: !!window._lastLoginAjaxSuccess,
-                                    suppressedSuccess: !!window._loginAjaxOriginalSuccessSuppressed,
-                                    suppressedError: !!window._loginAjaxOriginalErrorSuppressed,
-                                    result: parsed,
-                                    resultType: window._lastLoginResultType || (parsed && parsed.type) || '',
-                                    resultDesc: window._lastLoginResultDesc || (parsed && parsed.description) || '',
-                                    rawPreview: raw ? raw.slice(0, 800) : '',
-                                    url: window.location.href,
-                                };
-                            }
-                        """)
-                    except Exception:
-                        ajax_state = {}
-
-                    if ajax_state.get("result") or ajax_state.get("error") or ajax_state.get("seen"):
-                        break
-                    await page.wait_for_timeout(500)
-
-                if ajax_state.get("result"):
-                    result_data = ajax_state.get("result")
-                    logger.info(f"[Playwright] 📋 Resposta AJAX capturada via browser hook: {result_data}")
-                elif ajax_state.get("error"):
-                    logger.error(f"[Playwright] ❌ AJAX /login falhou no browser: {ajax_state}")
-                    raise RuntimeError(
-                        "Login AJAX failed in browser: "
-                        f"status={ajax_state.get('status')} "
-                        f"textStatus={ajax_state.get('textStatus')} "
-                        f"error={ajax_state.get('errorThrown')}"
-                    )
-                elif ajax_state.get("seen"):
-                    raw_preview = ajax_state.get("rawPreview") or ""
-                    if raw_preview:
-                        result_data = {"raw": raw_preview}
-                        logger.info(
-                            "[Playwright] 📋 AJAX /login visto sem JSON parseável; "
-                            f"raw={raw_preview[:300]}"
-                        )
-                else:
-                    logger.warning(f"[Playwright] AJAX /login não expôs resultado no browser hook: {ajax_state}")
-
-            if login_http_status == 429:
+            except Exception:
+                _stale_threshold = 110.0
+            try:
+                _age_anchor = captcha_token_received_at or captcha_start_time
+                _real_age = time_module.time() - (_age_anchor or time_module.time())
+            except Exception:
+                _real_age = 0.0
+            if _real_age >= _stale_threshold:
                 logger.error(
-                    "[Playwright] HTTP 429 no POST /login — limite de tentativas / bloqueio"
+                    f"[Playwright] ⛔ Abortando POST /login — token CAPTCHA tem "
+                    f"{_real_age:.1f}s desde receção pelo bot (limite {_stale_threshold:.0f}s, "
+                    "TTL Google ~120s). Submeter agora costuma devolver "
+                    "'Foi encontrado um erro ao executar a operação.'"
                 )
-                await _save_debug_html("login_429")
+                raise CaptchaTokenExpired(
+                    f"reCAPTCHA token age {_real_age:.1f}s exceeds safe limit "
+                    f"{_stale_threshold:.0f}s (Google TTL 120s); too long after solver return"
+                )
+    
+            # GUARDA: limitar cliques POST /login ao orçamento configurado
+            # (`login_transient_mne_error_retries` + 1). Retentativas reutilizam o
+            # mesmo token CAPTCHA até expirar ou o MNE responder de outra forma.
+            if login_post_click_count >= _max_login_post_attempts:
+                raise LoginPostSubmittedFailure(
+                    f"Login submit: limite de {_max_login_post_attempts} POST(s) /login atingido "
+                    f"(transient_mne_error_retries={_transient_mne_retries_max})."
+                )
+            login_post_click_count += 1
+            _is_mne_login_retry = login_post_click_count > 1
+            logger.info(
+                f"[Playwright] [submit-count] Click #{login_post_click_count}/{_max_login_post_attempts} "
+                "no botão de login (modo retentativa se MNE devolver erro genérico)."
+            )
+            if _is_mne_login_retry:
+                # Após o 1.º POST /login o MNE costuma deixar o botão desactivado/atrasado
+                # na mesma página; Playwright recusa clique se disabled.
                 try:
-                    await capture_browser_error_bundle(
-                        page, "login_rate_limited", username,
-                        RuntimeError("HTTP 429 no login"),
-                        extra_context={
-                            "http_status": 429,
-                            "response_body_preview": (body_text or "")[:800],
-                            "triage_hint": (
-                                "Site pode ter bloqueado o utilizador ou IP/proxy por excesso "
-                                "de tentativas."
-                            ),
-                        },
+                    await submit_button.wait_for(state="visible", timeout=5000)
+                except Exception:
+                    pass
+                try:
+                    await expect(submit_button).to_be_enabled(timeout=10000)
+                except Exception:
+                    logger.info(
+                        "[Playwright] Botão Iniciar Sessão ainda disabled — "
+                        "reactivação controlada para retentativa MNE."
+                    )
+                    try:
+                        await submit_button.evaluate(
+                            """(el) => {
+                                try {
+                                    el.removeAttribute('disabled');
+                                    el.disabled = false;
+                                    el.classList.remove('disabled');
+                                } catch (e) {}
+                            }"""
+                        )
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(400)
+
+            try:
+                await submit_button.click(
+                    delay=random.randint(20, 40),
+                    timeout=35000,
+                    force=bool(_is_mne_login_retry),
+                )
+            except Exception as _click_err:
+                if not _is_mne_login_retry:
+                    raise
+                logger.warning(
+                    f"[Playwright] Clique na retentativa falhou ({str(_click_err)[:120]}); "
+                    "segunda tentativa com force após reactivar o botão."
+                )
+                try:
+                    await submit_button.evaluate(
+                        """(el) => {
+                            try {
+                                el.removeAttribute('disabled');
+                                el.disabled = false;
+                            } catch (e) {}
+                        }"""
                     )
                 except Exception:
                     pass
-                raise RuntimeError(
-                    "Login HTTP 429 — possível bloqueio por taxa / utilizador bloqueado"
+                await page.wait_for_timeout(250)
+                await submit_button.click(
+                    delay=random.randint(10, 30),
+                    timeout=25000,
+                    force=True,
                 )
-
-            if login_http_status and login_http_status >= 500:
-                logger.error(f"[Playwright] HTTP {login_http_status} no POST /login")
-                await _save_debug_html("login_5xx")
+            logger.info(
+                f"[Playwright] [submit-count] Click #{login_post_click_count} concluído. "
+                "Aguardando POST /login na rede..."
+            )
+            
+            # 7. Processa o resultado
+            try:
                 try:
-                    await capture_browser_error_bundle(
-                        page, "login_server_http_error", username,
-                        RuntimeError(f"HTTP {login_http_status} no login"),
-                        extra_context={
-                            "http_status": login_http_status,
-                            "response_body_preview": (body_text or "")[:800],
-                            "triage_hint": (
-                                "Erro no servidor MNE; pode ser temporário. Retentar mais tarde "
-                                "ou outro proxy."
-                            ),
-                        },
+                    _login_wait_sec = float(
+                        (scraper_settings or {}).get("login_response_wait_seconds", 75) or 75
                     )
                 except Exception:
-                    pass
-                raise RuntimeError(f"Login falhou com HTTP {login_http_status}")
-
-            if result_data and isinstance(result_data, dict):
-                r_type = result_data.get('type', '').lower()
-                r_desc = _normalize_server_text(result_data.get('description', ''))
-                raw_response = _normalize_server_text(str(result_data.get('raw') or ''))
-                if raw_response and (
-                    'NewloginForm-d' in raw_response
-                    or 'Authentication.jsp' in raw_response
-                    or 'Iniciar Sessão' in raw_response
-                    or 'Perdeu a sessão' in raw_response
-                    or 'Session lost' in raw_response
-                ):
+                    _login_wait_sec = 75.0
+                _login_wait_sec = max(15.0, min(float(_login_wait_sec), 180.0))
+                login_response = await asyncio.wait_for(
+                    lr_fut(), timeout=_login_wait_sec
+                )
+                login_http_status = getattr(login_response, "status", None)
+    
+                # Ler o body da resposta capturada
+                result_data = None
+                body_text = ""
+                try:
+                    body_bytes = await login_response.body()
+                    body_text  = _normalize_server_text(
+                        body_bytes.decode('utf-8', errors='replace').strip()
+                    )
+                    if body_text:
+                        try:
+                            result_data = json.loads(body_text)
+                            logger.info(f"[Playwright] 📋 Resposta do servidor (JSON): {result_data}")
+                        except json.JSONDecodeError:
+                            # Nao e JSON — pode ser HTML de redirect ou mensagem simples
+                            result_data = {"raw": body_text}
+                            logger.info(f"[Playwright] 📋 Resposta do servidor (raw): {body_text[:300]}")
+                    else:
+                        logger.info("[Playwright] 📋 Resposta vazia — provavelmente redirect imediato (OK)")
+                except Exception as _body_err:
+                    logger.warning(f"[Playwright] Nao foi possivel ler body da resposta: {_body_err}")
+    
+                if result_data is None:
+                    captured_result = getattr(page, "_login_result", None)
+                    if captured_result:
+                        result_data = captured_result
+                        logger.info(f"[Playwright] 📋 Resposta AJAX recuperada do handler: {result_data}")
+    
+                if result_data is None:
+                    ajax_state = {}
+                    for ajax_wait in range(24):
+                        try:
+                            ajax_state = await page.evaluate("""
+                                () => {
+                                    const raw = window._lastLoginRaw || '';
+                                    let parsed = window._lastLoginResult || null;
+                                    if (!parsed && raw) {
+                                        try { parsed = JSON.parse(raw); } catch (e) {}
+                                    }
+                                    return {
+                                        seen: !!window._lastLoginAjaxSeen,
+                                        error: !!window._lastLoginAjaxError,
+                                        status: window._lastLoginAjaxStatus || null,
+                                        textStatus: window._lastLoginAjaxTextStatus || '',
+                                        errorThrown: window._lastLoginAjaxErrorThrown || '',
+                                        success: !!window._lastLoginAjaxSuccess,
+                                        suppressedSuccess: !!window._loginAjaxOriginalSuccessSuppressed,
+                                        suppressedError: !!window._loginAjaxOriginalErrorSuppressed,
+                                        result: parsed,
+                                        resultType: window._lastLoginResultType || (parsed && parsed.type) || '',
+                                        resultDesc: window._lastLoginResultDesc || (parsed && parsed.description) || '',
+                                        rawPreview: raw ? raw.slice(0, 800) : '',
+                                        url: window.location.href,
+                                    };
+                                }
+                            """)
+                        except Exception:
+                            ajax_state = {}
+    
+                        if ajax_state.get("result") or ajax_state.get("error") or ajax_state.get("seen"):
+                            break
+                        await page.wait_for_timeout(500)
+    
+                    if ajax_state.get("result"):
+                        result_data = ajax_state.get("result")
+                        logger.info(f"[Playwright] 📋 Resposta AJAX capturada via browser hook: {result_data}")
+                    elif ajax_state.get("error"):
+                        logger.error(f"[Playwright] ❌ AJAX /login falhou no browser: {ajax_state}")
+                        raise RuntimeError(
+                            "Login AJAX failed in browser: "
+                            f"status={ajax_state.get('status')} "
+                            f"textStatus={ajax_state.get('textStatus')} "
+                            f"error={ajax_state.get('errorThrown')}"
+                        )
+                    elif ajax_state.get("seen"):
+                        raw_preview = ajax_state.get("rawPreview") or ""
+                        if raw_preview:
+                            result_data = {"raw": raw_preview}
+                            logger.info(
+                                "[Playwright] 📋 AJAX /login visto sem JSON parseável; "
+                                f"raw={raw_preview[:300]}"
+                            )
+                    else:
+                        logger.warning(f"[Playwright] AJAX /login não expôs resultado no browser hook: {ajax_state}")
+    
+                if login_http_status == 429:
                     logger.error(
-                        "[Playwright] ❌ POST /login devolveu HTML de login/sessão perdida, "
-                        "não é login aceite."
+                        "[Playwright] HTTP 429 no POST /login — limite de tentativas / bloqueio"
                     )
-                    await _save_debug_html("login_returned_authentication_html")
-                    raise RuntimeError(
-                        "Login rejected/unknown: /login returned authentication or session-lost HTML"
-                    )
-                
-                if r_type in ['error', 'recaptchaerror', 'secblock', 'warning', 'redirect', 'rgpderror']:
-                    logger.error(
-                        f"[Playwright] ❌ SERVIDOR REJEITOU: http={login_http_status} "
-                        f"tipo={r_type}, desc={r_desc}"
-                    )
-                    await _save_debug_html("login_rejected")
-                    _generic_pt = (
-                        "foi encontrado um erro ao executar" in (r_desc or "").lower()
-                    )
+                    _pu_429 = ""
+                    try:
+                        _pu_429 = str(page.url or "")
+                    except Exception:
+                        pass
+                    _t_cap_429 = None
+                    try:
+                        _t_cap_429 = float(
+                            time_module.time() - captcha_received_time
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        blocking_diagnostics_emit(
+                            phase="mne_http_429_login_post",
+                            username=username,
+                            proxy_raw=proxy_raw,
+                            egress_ipv4_hint=_eg_hint_blk,
+                            http_status=429,
+                            ajax_submit_click_index=login_post_click_count,
+                            network_login_post_count=login_post_network_count,
+                            body_antibot_classification="http_429_rate_limit",
+                            seconds_since_login_start=(
+                                float(time_module.time()) - float(login_start_time)
+                            ),
+                            seconds_captcha_to_submit=_t_cap_429,
+                            page_url=_pu_429,
+                            user_agent_short=(
+                                user_agent[:320] if isinstance(user_agent, str) else ""
+                            ),
+                            extra={"hint": "Backoff e rotação de proxy; evitar rajadas no mesmo IP."},
+                        )
+                    except Exception:
+                        pass
+                    await _save_debug_html("login_429")
                     try:
                         await capture_browser_error_bundle(
-                            page, "login_rejected_server", username,
-                            RuntimeError(f"{r_type}: {r_desc}"),
+                            page, "login_rate_limited", username,
+                            RuntimeError("HTTP 429 no login"),
                             extra_context={
-                                "http_status": login_http_status,
+                                "http_status": 429,
                                 "response_body_preview": (body_text or "")[:800],
-                                "server_message_type": r_type,
-                                "server_message_description": (r_desc or "")[:2000],
                                 "triage_hint": (
-                                    "Mensagem genérica do site: frequentemente credenciais "
-                                    "inválidas, conta bloqueada, sessão/captcha inválido, ou "
-                                    "falha backend. Ver HTTP status e body_preview; testar login "
-                                    "manual no mesmo proxy."
-                                    if _generic_pt
-                                    else "Ver descrição do servidor e testar login manual se necessário."
+                                    "Site pode ter bloqueado o utilizador ou IP/proxy por excesso "
+                                    "de tentativas."
                                 ),
                             },
                         )
                     except Exception:
                         pass
-                    raise RuntimeError(f"Login Rejeitado pelo Site: {r_type} - {r_desc}")
-                
-                if not r_type and r_desc:
-                    logger.warning(f"[Playwright] ⚠️ Resposta sem tipo mas com descrição: {r_desc}")
-                
-                result_str = str(result_data).lower()
-                if 'error' in result_str or 'invalid' in result_str or 'blocked' in result_str or 'captcha' in result_str:
-                    # Verificar se e raw HTML (pode ter "error" em scripts) — nao e erro real
-                    if result_data.get('raw') and len(result_data['raw']) > 500:
-                        logger.info("[Playwright] Resposta raw longa — provavelmente HTML de redirect (OK)")
-                    else:
-                        logger.error(f"[Playwright] ❌ Possível erro na resposta: {result_data}")
-                        await _save_debug_html("login_rejected_suspect")
+                    raise RuntimeError(
+                        "Login HTTP 429 — possível bloqueio por taxa / utilizador bloqueado"
+                    )
+    
+                if login_http_status and login_http_status >= 500:
+                    logger.error(f"[Playwright] HTTP {login_http_status} no POST /login")
+                    _pu_5 = ""
+                    try:
+                        _pu_5 = str(page.url or "")
+                    except Exception:
+                        pass
+                    _t_cap_5 = None
+                    try:
+                        _t_cap_5 = float(
+                            time_module.time() - captcha_received_time
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        blocking_diagnostics_emit(
+                            phase="mne_http_5xx_login_post",
+                            username=username,
+                            proxy_raw=proxy_raw,
+                            egress_ipv4_hint=_eg_hint_blk,
+                            http_status=int(login_http_status),
+                            ajax_submit_click_index=login_post_click_count,
+                            network_login_post_count=login_post_network_count,
+                            body_antibot_classification="http_5xx_upstream",
+                            seconds_since_login_start=(
+                                float(time_module.time()) - float(login_start_time)
+                            ),
+                            seconds_captcha_to_submit=_t_cap_5,
+                            page_url=_pu_5,
+                            user_agent_short=(
+                                user_agent[:320] if isinstance(user_agent, str) else ""
+                            ),
+                            extra={"hint": "Erro servidor MNE; retentar após backoff ou outro exit."},
+                        )
+                    except Exception:
+                        pass
+                    await _save_debug_html("login_5xx")
+                    try:
+                        await capture_browser_error_bundle(
+                            page, "login_server_http_error", username,
+                            RuntimeError(f"HTTP {login_http_status} no login"),
+                            extra_context={
+                                "http_status": login_http_status,
+                                "response_body_preview": (body_text or "")[:800],
+                                "triage_hint": (
+                                    "Erro no servidor MNE; pode ser temporário. Retentar mais tarde "
+                                    "ou outro proxy."
+                                ),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Login falhou com HTTP {login_http_status}")
+    
+                if result_data and isinstance(result_data, dict):
+                    r_type = result_data.get('type', '').lower()
+                    r_desc = _normalize_server_text(result_data.get('description', ''))
+                    raw_response = _normalize_server_text(str(result_data.get('raw') or ''))
+                    if raw_response and (
+                        'NewloginForm-d' in raw_response
+                        or 'Authentication.jsp' in raw_response
+                        or 'Iniciar Sessão' in raw_response
+                        or 'Perdeu a sessão' in raw_response
+                        or 'Session lost' in raw_response
+                    ):
+                        logger.error(
+                            "[Playwright] ❌ POST /login devolveu HTML de login/sessão perdida, "
+                            "não é login aceite."
+                        )
+                        await _save_debug_html("login_returned_authentication_html")
+                        raise RuntimeError(
+                            "Login rejected/unknown: /login returned authentication or session-lost HTML"
+                        )
+
+                    _challenge_body = (
+                        str(result_data.get("raw") or "").strip() or (body_text or "").strip()
+                    )
+                    if _is_mne_login_antibot_challenge_html(_challenge_body):
+                        try:
+                            _poll_s = float(
+                                (scraper_settings or {}).get(
+                                    "login_challenge_ajax_poll_seconds", 18.0
+                                )
+                                or 18.0
+                            )
+                        except Exception:
+                            _poll_s = 18.0
+                        _poll_s = max(8.0, min(120.0, _poll_s))
+                        logger.warning(
+                            "[Playwright] POST /login devolveu HTML de desafio /ch/ (antibot/WAF). "
+                            f"À espera até {_poll_s:.0f}s do hook AJAX pelo JSON real de login..."
+                        )
+                        if login_post_click_count > 1:
+                            logger.warning(
+                                "[Playwright] Desafio /ch/ após clique #%s no mesmo fluxo "
+                                "(retentativa MNE com o mesmo token CAPTCHA). O servidor pode "
+                                "escalar para antibot após vários POST /login rápidos; considere "
+                                "reduzir `login_transient_mne_error_retries` em config ou aumentar "
+                                "o backoff entre tentativas.",
+                                login_post_click_count,
+                            )
+                        _post_ch_json = await _mne_sleep_poll_ajax_login_json_after_challenge(
+                            page,
+                            max_wait_s=_poll_s,
+                            challenge_html=_challenge_body,
+                        )
+                        if isinstance(_post_ch_json, dict) and _post_ch_json.get("type"):
+                            result_data = _post_ch_json
+                            r_type = result_data.get("type", "").lower()
+                            r_desc = _normalize_server_text(
+                                result_data.get("description", "")
+                            )
+                            raw_response = _normalize_server_text(
+                                str(result_data.get("raw") or "")
+                            )
+                            logger.info(
+                                "[Playwright] ✅ Após /ch/, hook AJAX actualizou login: "
+                                f"type={r_type!r}"
+                            )
+                        else:
+                            logger.error(
+                                "[Playwright] ❌ Resposta /login foi desafio /ch/ mas não apareceu "
+                                "JSON de login no hook — não marcar sessão válida."
+                            )
+                            _pu_ch = ""
+                            try:
+                                _pu_ch = str(page.url or "")
+                            except Exception:
+                                pass
+                            _replay_n_done = getattr(
+                                page, "_mne_challenge_login_replay_count", None
+                            )
+                            _t_since_cap = None
+                            try:
+                                _t_since_cap = float(
+                                    time_module.time() - captcha_received_time
+                                )
+                            except Exception:
+                                pass
+                            blocking_diagnostics_emit(
+                                phase="mne_perimeter_challenge_no_followup_json",
+                                username=username,
+                                proxy_raw=proxy_raw,
+                                egress_ipv4_hint=_eg_hint_blk,
+                                http_status=login_http_status,
+                                ajax_submit_click_index=login_post_click_count,
+                                network_login_post_count=login_post_network_count,
+                                body_antibot_classification=(
+                                    "perimeter_challenge_html_under_host_ch_star"
+                                ),
+                                challenge_poll_budget_sec=float(_poll_s),
+                                challenge_replay_js_count=(
+                                    int(_replay_n_done)
+                                    if isinstance(_replay_n_done, (int, float))
+                                    else None
+                                ),
+                                seconds_since_login_start=(
+                                    float(time_module.time()) - float(login_start_time)
+                                ),
+                                seconds_captcha_to_submit=_t_since_cap,
+                                page_url=_pu_ch,
+                                user_agent_short=(
+                                    user_agent[:320] if isinstance(user_agent, str) else ""
+                                ),
+                                extra={
+                                    "bd_js_marker": "/ch/bd.js"
+                                    in str(_challenge_body or ""),
+                                    "challenge_chars": len(_challenge_body or ""),
+                                },
+                            )
+                            await _save_debug_html("login_antibot_challenge_no_json")
+                            try:
+                                await capture_browser_error_bundle(
+                                    page,
+                                    "login_antibot_challenge",
+                                    username,
+                                    RuntimeError("MNE /ch/ challenge stuck on POST /login"),
+                                    extra_context={
+                                        "http_status": login_http_status,
+                                        "response_body_preview": _challenge_body[:1200],
+                                        "triage_hint": (
+                                            "Corpo foi HTML /ch/bd.js — antibot antes do resultado de login. "
+                                            "Retente com pausa maior ou outro exit de proxy."
+                                        ),
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                "Login challenge: servidor devolveu HTML /ch/bd.js no POST /login; "
+                                "sem JSON no hook após espera — credenciais não completaram login."
+                            )
+                    
+                    if r_type in ['error', 'recaptchaerror', 'secblock', 'warning', 'redirect', 'rgpderror']:
+                        _generic_pt = (
+                            "foi encontrado um erro ao executar" in (r_desc or "").lower()
+                        )
+                        recoverable_mne_op = (
+                            _cfg_bool(
+                                "login_retry_transient_mne_generic_operation_error", True
+                            )
+                            and r_type == "error"
+                            and _generic_pt
+                            and (login_http_status or 200) == 200
+                            and transient_mne_attempts_used < _transient_mne_retries_max
+                        )
+                        if recoverable_mne_op:
+                            transient_mne_attempts_used += 1
+                            logger.warning(
+                                "[Playwright] MNE devolveu erro genérico de operação (HTTP 200) — "
+                                "pode ser sobrecarga/back-end. Novo POST /login com o MESMO token "
+                                f"CAPTCHA após backoff "
+                                f"(tentativa_extra {transient_mne_attempts_used}/"
+                                f"{_transient_mne_retries_max}; sem novo solve)."
+                            )
+                            logger.info(
+                                "[Playwright] O mesmo texto de erro pode aparecer quando o token "
+                                "reCAPTCHA expira ou o verify falha no MNE/Google; não pressupor "
+                                "só sobrecarga. Com login por CapMonster (proxyless) o solver não usa "
+                                "o exit SOAX do browser — avalie `login_transient_mne_error_retries` "
+                                "se respostas /ch/ surgirem após estas retentativas rápidas."
+                            )
+                            _lr_hold["cur"] = asyncio.Future()
+                            try:
+                                page._mne_login_challenge_early_inject_done = False
+                            except Exception:
+                                pass
+                            try:
+                                await page.evaluate(
+                                    """() => {
+                                        try {
+                                            window._lastLoginRaw = '';
+                                            window._lastLoginAjaxSeen = false;
+                                            window._lastLoginAjaxError = false;
+                                            window._lastLoginAjaxSuccess = false;
+                                            window._lastLoginResult = null;
+                                            window._lastLoginResultType = '';
+                                            window._lastLoginResultDesc = '';
+                                        } catch (e) {}
+                                    }"""
+                                )
+                            except Exception:
+                                pass
+                            _bb = max(
+                                2.0,
+                                _cfg_float("login_transient_mne_error_backoff_sec", 12.0),
+                            )
+                            await page.wait_for_timeout(
+                                int((_bb + random.uniform(0.0, 5.0)) * 1000)
+                            )
+                            continue
+
+                        logger.error(
+                            f"[Playwright] ❌ SERVIDOR REJEITOU: http={login_http_status} "
+                            f"tipo={r_type}, desc={r_desc}"
+                        )
+                        await _save_debug_html("login_rejected")
                         try:
                             await capture_browser_error_bundle(
-                                page, "login_rejected_suspect", username,
-                                RuntimeError(str(result_data)[:2000]),
+                                page, "login_rejected_server", username,
+                                RuntimeError(f"{r_type}: {r_desc}"),
                                 extra_context={
                                     "http_status": login_http_status,
                                     "response_body_preview": (body_text or "")[:800],
+                                    "server_message_type": r_type,
+                                    "server_message_description": (r_desc or "")[:2000],
+                                    "triage_hint": (
+                                        "Mensagem genérica: credenciais/conta, CAPTCHA/sessão expirada, "
+                                        "ou sobrecarga persistente do MNE (não necessariamente só DDoS)."
+                                        if _generic_pt
+                                        else "Ver descrição do servidor e testar login manual se necessário."
+                                    ),
                                 },
                             )
                         except Exception:
                             pass
-                        raise RuntimeError(f"Login possivelmente rejeitado: {result_data}")
+                        _pu_srv = ""
+                        try:
+                            _pu_srv = str(page.url or "")
+                        except Exception:
+                            pass
+                        _t_cap_srv = None
+                        try:
+                            _t_cap_srv = float(
+                                time_module.time() - captcha_received_time
+                            )
+                        except Exception:
+                            pass
+                        blocking_diagnostics_emit(
+                            phase="mne_server_ajax_rejection_json",
+                            username=username,
+                            proxy_raw=proxy_raw,
+                            egress_ipv4_hint=_eg_hint_blk,
+                            http_status=login_http_status,
+                            ajax_submit_click_index=login_post_click_count,
+                            network_login_post_count=login_post_network_count,
+                            server_message_type=r_type,
+                            server_message_desc=r_desc,
+                            body_antibot_classification=(
+                                "application_json_login_generic_operation"
+                                if _generic_pt
+                                else "application_json_login_server_message"
+                            ),
+                            seconds_since_login_start=(
+                                float(time_module.time()) - float(login_start_time)
+                            ),
+                            seconds_captcha_to_submit=_t_cap_srv,
+                            page_url=_pu_srv,
+                            user_agent_short=(
+                                user_agent[:320] if isinstance(user_agent, str) else ""
+                            ),
+                            extra={
+                                "login_retry_transient_mne_generic_cfg": _cfg_bool(
+                                    "login_retry_transient_mne_generic_operation_error",
+                                    True,
+                                ),
+                                "transient_mne_error_retries_used": transient_mne_attempts_used,
+                                "transient_mne_error_retries_cfg_max": _transient_mne_retries_max,
+                                "generic_operation_error_marker": bool(_generic_pt),
+                            },
+                        )
+                        raise RuntimeError(f"Login Rejeitado pelo Site: {r_type} - {r_desc}")
+                    
+                    if not r_type and r_desc:
+                        logger.warning(f"[Playwright] ⚠️ Resposta sem tipo mas com descrição: {r_desc}")
+                    
+                    result_str = str(result_data).lower()
+                    if 'error' in result_str or 'invalid' in result_str or 'blocked' in result_str or 'captcha' in result_str:
+                        # Verificar se e raw HTML (pode ter "error" em scripts) — nao e erro real
+                        _raw_len = result_data.get('raw')
+                        if _raw_len and len(_raw_len) > 500:
+                            if _is_mne_login_antibot_challenge_html(str(_raw_len)):
+                                logger.error(
+                                    "[Playwright] ❌ HTML /ch/ (antibot) tratado como redirect — "
+                                    "bloqueio de falso positivo."
+                                )
+                                raise RuntimeError(
+                                    "Login challenge: corpo /login contém /ch/bd.js; "
+                                    "não é redirect de login válido."
+                                )
+                            logger.info("[Playwright] Resposta raw longa — provavelmente HTML de redirect (OK)")
+                        else:
+                            logger.error(f"[Playwright] ❌ Possível erro na resposta: {result_data}")
+                            await _save_debug_html("login_rejected_suspect")
+                            try:
+                                await capture_browser_error_bundle(
+                                    page, "login_rejected_suspect", username,
+                                    RuntimeError(str(result_data)[:2000]),
+                                    extra_context={
+                                        "http_status": login_http_status,
+                                        "response_body_preview": (body_text or "")[:800],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            raise RuntimeError(f"Login possivelmente rejeitado: {result_data}")
+                    
+                    logger.info(f"[Playwright] ✅ Login Aceito! Tipo: {r_type or 'redirect/OK'}")
+                    if _blocking_diagnostics_success_baseline_enabled():
+                        _pu_ok = ""
+                        try:
+                            _pu_ok = str(page.url or "")
+                        except Exception:
+                            pass
+                        _t_cap_ok = None
+                        try:
+                            _t_cap_ok = float(
+                                time_module.time() - captcha_received_time
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            blocking_diagnostics_emit(
+                                phase="mne_server_ajax_accept_baseline",
+                                username=username,
+                                proxy_raw=proxy_raw,
+                                egress_ipv4_hint=_eg_hint_blk,
+                                http_status=login_http_status,
+                                ajax_submit_click_index=login_post_click_count,
+                                network_login_post_count=login_post_network_count,
+                                server_message_type=(r_type or "ok"),
+                                server_message_desc=r_desc,
+                                body_antibot_classification="application_json_login_success",
+                                seconds_since_login_start=(
+                                    float(time_module.time())
+                                    - float(login_start_time)
+                                ),
+                                seconds_captcha_to_submit=_t_cap_ok,
+                                page_url=_pu_ok,
+                                user_agent_short=(
+                                    user_agent[:320]
+                                    if isinstance(user_agent, str)
+                                    else ""
+                                ),
+                                extra={"outcome": "ajax_json_accept"},
+                            )
+                        except Exception:
+                            pass
+                    login_post_accepted = True
+                    break
+                else:
+                    current_after_login = ""
+                    try:
+                        current_after_login = page.url
+                    except Exception:
+                        pass
+                    if "Authentication.jsp" in current_after_login:
+                        logger.error(
+                            "[Playwright] ❌ Resultado do login desconhecido: POST /login respondeu, "
+                            "mas nenhum JSON/AJAX foi capturado e a página continua no login."
+                        )
+                        await _save_debug_html("login_unknown_still_authentication")
+                        raise RuntimeError(
+                            "Login outcome unknown: no trustworthy AJAX response and still on Authentication.jsp"
+                        )
+                    logger.info(
+                        "[Playwright] ✅ Login aceito por navegação/redirect confirmado "
+                        f"(URL atual={current_after_login or 'unknown'})"
+                    )
+                    login_post_accepted = True
+                    break
                 
-                logger.info(f"[Playwright] ✅ Login Aceito! Tipo: {r_type or 'redirect/OK'}")
-                login_post_accepted = True
-            else:
-                current_after_login = ""
-                try:
-                    current_after_login = page.url
-                except Exception:
-                    pass
-                if "Authentication.jsp" in current_after_login:
-                    logger.error(
-                        "[Playwright] ❌ Resultado do login desconhecido: POST /login respondeu, "
-                        "mas nenhum JSON/AJAX foi capturado e a página continua no login."
-                    )
-                    await _save_debug_html("login_unknown_still_authentication")
-                    raise RuntimeError(
-                        "Login outcome unknown: no trustworthy AJAX response and still on Authentication.jsp"
-                    )
-                logger.info(
-                    "[Playwright] ✅ Login aceito por navegação/redirect confirmado "
-                    f"(URL atual={current_after_login or 'unknown'})"
-                )
-                login_post_accepted = True
-            
-        except asyncio.TimeoutError:
-             logger.error("[Playwright] ❌ TIMEOUT após clique.")
-             await _save_debug_html("timeout_submit")
-             try:
-                 await capture_browser_error_bundle(
-                     page, "login_submit_timeout", username, asyncio.TimeoutError(),
-                 )
-             except Exception:
-                 pass
-             raise RuntimeError("Timeout no Submit")             
+            except asyncio.TimeoutError:
+                 logger.error("[Playwright] ❌ TIMEOUT após clique.")
+                 await _save_debug_html("timeout_submit")
+                 try:
+                     await capture_browser_error_bundle(
+                         page, "login_submit_timeout", username, asyncio.TimeoutError(),
+                     )
+                 except Exception:
+                     pass
+                 raise RuntimeError("Timeout no Submit")
+            break
+
         submit_time = time_module.time() - login_start_time
         logger.info(
             "[Playwright] ✅ Login submitted in %.1fs total"
@@ -10534,18 +13431,33 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         )
         # Auditoria final do submit do login: clicks no nosso lado vs POSTs
         # observados na rede. Em condições normais ambos devem ser exactamente 1.
-        if login_post_click_count != 1 or login_post_network_count != 1:
+        expected_posts = max(1, min(_max_login_post_attempts, 20))
+        if login_post_click_count != login_post_network_count:
             logger.warning(
-                f"[Playwright] [submit-count] AUDITORIA login submit: "
-                f"clicks_nosso_lado={login_post_click_count} | "
-                f"POSTs_observados_na_rede={login_post_network_count} "
-                "(esperado: 1/1)."
+                "[Playwright] [submit-count] AUDITORIA: clicks vs POST discordantes: "
+                f"clicks={login_post_click_count} posts={login_post_network_count}"
+            )
+        elif (
+            login_post_click_count != 1
+            and login_post_click_count != expected_posts
+            and login_post_network_count != expected_posts
+        ):
+            logger.warning(
+                f"[Playwright] [submit-count] AUDITORIA login submit fora do esperado: "
+                f"clicks={login_post_click_count} | POST={login_post_network_count} "
+                f"(esperado 1 OU até {expected_posts} com retentativa MNE)."
+            )
+        elif login_post_click_count == login_post_network_count == 1:
+            logger.info(
+                f"[Playwright] [submit-count] ✅ Login submit OK: "
+                f"clicks=1 | POST /login=1 (sem retentativa)."
             )
         else:
             logger.info(
-                f"[Playwright] [submit-count] ✅ Login submit OK: "
-                f"clicks=1 | POST /login=1 (sem duplicação)."
-        )
+                "[Playwright] [submit-count] ✅ Login submit OK com retentativa MNE: "
+                f"clicks={login_post_click_count} | POST /login={login_post_network_count} "
+                "(reutilizou mesmo CAPTCHA após backoff)."
+            )
 
         try:
             await page.wait_for_load_state('domcontentloaded', timeout=10000)
@@ -11112,11 +14024,39 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
     
      # --- CAPTURA: resposta visível do browser (JSON + screenshot) + fallback PNG legado ---
     except Exception as e:
-        pool_should_invalidate = True
-        logger.error(f"[Playwright Internal] Erro critico: {e}")
+        _els = str(e).lower()
+        _soft_403_retry = LOGIN_403_MARKER_TRANSIENT_RETRY in _els
+        _captcha_ttl_abort = isinstance(e, CaptchaTokenExpired)
+        _login_challenge_abort = "login challenge:" in _els
+        # Erros onde browser/proxy estão OK: não invalidar BrowserPool nem capturas pesadas.
+        pool_should_invalidate = not (
+            _soft_403_retry or _captcha_ttl_abort or _login_challenge_abort
+        )
+        if _soft_403_retry:
+            logger.warning(
+                f"[Playwright Internal] Login parado sem invalidar pool (403 soft pós-retentativa): {e}"
+            )
+        elif _captcha_ttl_abort:
+            logger.warning(
+                f"[Playwright Internal] Login abortado por token CAPTCHA caducado — "
+                f"BrowserPool preservado ({type(e).__name__}). {e}"
+            )
+        elif _login_challenge_abort:
+            logger.warning(
+                f"[Playwright Internal] Desafio MNE /ch/ no POST /login — BrowserPool preservado "
+                f"(o proxy não deve ser tratado como túnel partido). {e}"
+            )
+        else:
+            logger.error(f"[Playwright Internal] Erro critico: {e}")
         try:
             _pg = locals().get("page")
-            if _pg and not _playwright_login_error_already_bundled(e):
+            if (
+                _pg
+                and not _playwright_login_error_already_bundled(e)
+                and not _soft_403_retry
+                and not _captcha_ttl_abort
+                and not _login_challenge_abort
+            ):
                 await capture_browser_error_bundle(_pg, "critical_playwright", username, e)
             elif _pg and _playwright_login_error_already_bundled(e):
                 logger.info(
@@ -11126,15 +14066,21 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         except Exception as _cap_err:
             logger.debug(f"[BrowserCapture] critical: {_cap_err}")
         try:
-            debug_dir = os.path.join(WORKING_DIR, "debug_screenshots")
-            os.makedirs(debug_dir, exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            safe_user = (username or "unknown").replace("/", "_").replace("\\", "_")
-            path = os.path.join(debug_dir, f"{safe_user}_CRITICAL_ERROR_{ts}.png")
-            _pg2 = locals().get("page")
-            if _pg2:
-                await _pg2.screenshot(path=path, full_page=True)
-                logger.info(f"[Debug] Screenshot de ERRO legado: {path}")
+            if (
+                _local_debug_artifacts_enabled()
+                and not _soft_403_retry
+                and not _captcha_ttl_abort
+                and not _login_challenge_abort
+            ):
+                debug_dir = os.path.join(WORKING_DIR, "debug_screenshots")
+                os.makedirs(debug_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                safe_user = (username or "unknown").replace("/", "_").replace("\\", "_")
+                path = os.path.join(debug_dir, f"{safe_user}_CRITICAL_ERROR_{ts}.png")
+                _pg2 = locals().get("page")
+                if _pg2:
+                    await _pg2.screenshot(path=path, full_page=True)
+                    logger.info(f"[Debug] Screenshot de ERRO legado: {path}")
         except Exception:
             pass
         # Se o POST /login já tinha sido aceite, qualquer excepção aqui é
@@ -11149,10 +14095,14 @@ async def _playwright_login_internal(username: str, password: str, solve_recaptc
         # como LoginPostSubmittedFailure, porque isso ativa o caminho de
         # "network abort" e acaba por banir o proxy / prender o utilizador
         # como se a ligação tivesse morrido antes da resposta existir.
+        # Desafio /ch/ na resposta de /login — resposta HTTP existe; não usar o caminho de
+        # "abort de rede antes da resposta" (ban de proxy LoginPostSubmittedFailure).
+        _elower = str(e).lower()
         if (
             login_post_submitted
             and not isinstance(e, (PostLoginFailure, LoginPostSubmittedFailure))
             and not _login_fatal_skip_captcha_key_rotate(str(e))
+            and "login challenge:" not in _elower
         ):
             raise LoginPostSubmittedFailure(
                 f"submitted POST /login failed before trustworthy response: {e}"
@@ -11196,6 +14146,17 @@ def _classify_proxy_error(error_str: str) -> str:
     if _is_site_unavailable_error(error_str):
         return 'site_unavailable'  # Indisponibilidade do MNE; proxy inocente
     error_str = error_str.lower()
+    # 403 no segundo+ POST /login após erro MNE transitório — não confundir com IP ban permanente.
+    if LOGIN_403_MARKER_TRANSIENT_RETRY in error_str:
+        return 'transient_retry_403'
+    # Resposta /login após esgotar retentativas POST no Playwright — não implica proxy morto.
+    if (
+        "login rejeitado pelo site:" in error_str
+        and "foi encontrado um erro ao executar" in error_str
+    ):
+        return 'mne_generic_operation'
+    if "login challenge:" in error_str:
+        return 'mne_challenge'  # HTML /ch/ no POST /login — não é falha típica de proxy HTTP
     if any(x in error_str for x in ['err_tunnel_connection_failed', 'err_proxy_connection_failed',
                                       'tunnel connection failed', 'proxy connection failed']):
         return 'tunnel_fail'   # Proxy morto / porta fechada
@@ -11235,12 +14196,55 @@ async def Login(client: httpx.Client, username: str, password: str, user_agent: 
                 await asyncio.sleep(float(scraper_settings.get("captcha_balance_wait_sec", 120)) if scraper_settings else 120)
                 continue
 
-            logger.info(f"[Login] Attempting login (retries remaining: {retry}, proxy: {current_proxy.split(':')[0] if current_proxy else 'N/A'})...")
-            login_result = await playwright_login(username, password, solve_recaptcha_v2,
-                                                  current_proxy, user_agent, captcha_key_index)
+            login_engine = str(
+                (scraper_settings or {}).get("login_engine")
+                or os.environ.get("LOGIN_ENGINE")
+                or "playwright"
+            ).strip().lower()
+            logger.info(
+                f"[Login] Attempting login via {login_engine} "
+                f"(retries remaining: {retry}, proxy: {current_proxy.split(':')[0] if current_proxy else 'N/A'})..."
+            )
+            _solve_fn = solve_recaptcha_v2
+            _eg_vis = str(
+                getattr(current_client, "_visa_proxy_validator_exit_ipv4", "") or ""
+            ).strip()
+            _eg_lit = None
+            if _eg_vis:
+                if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", _eg_vis):
+                    try:
+                        if all(0 <= int(x) <= 255 for x in _eg_vis.split(".")):
+                            _eg_lit = _eg_vis
+                    except ValueError:
+                        _eg_lit = None
+            if _eg_lit:
+                _solve_fn = functools.partial(
+                    solve_recaptcha_v2,
+                    proxy_egress_ipv4=_eg_lit,
+                )
+
+            if login_engine in ("http", "http_tls", "tls", "curl", "curl_cffi"):
+                login_result = await http_tls_login(
+                    username,
+                    password,
+                    _solve_fn,
+                    current_proxy,
+                    user_agent,
+                    captcha_key_index,
+                )
+            else:
+                login_result = await playwright_login(
+                    username,
+                    password,
+                    _solve_fn,
+                    current_proxy,
+                    user_agent,
+                    captcha_key_index,
+                    proxy_egress_ipv4=_eg_lit or _eg_vis or None,
+                )
 
             if login_result is None:
-                logger.warning("[Login] Playwright login returned None — rotating proxy...")
+                logger.warning(f"[Login] {login_engine} login returned None — rotating proxy...")
                 if current_proxy and state_manager:
                     state_manager.update_proxy_score(current_proxy, -10)
                 current_proxy, current_client = _rotate_proxy(
@@ -11286,15 +14290,30 @@ async def Login(client: httpx.Client, username: str, password: str, user_agent: 
             # chegado ao edge do MNE e uma segunda tentativa imediata tende
             # a parecer automação. Penalizar o proxy que largou o POST e
             # propagar para main()/worker pararem.
+            post_submit_error_type = _classify_proxy_error(str(lpsf))
+            if post_submit_error_type == "mne_challenge":
+                logger.error(
+                    f"[Login] {username}: desafio /ch/ (antibot) após POST /login "
+                    "(excepção LPSF herdada — proxy não banido)."
+                )
+                raise
             logger.error(
                 f"[Login] {username}: POST /login já submetido — parar retry loop "
-                f"(retry gastaria outro CAPTCHA): {str(lpsf)[:180]}"
+                f"(retry gastaria outro CAPTCHA; proxy_error={post_submit_error_type}): "
+                f"{str(lpsf)[:180]}"
             )
             if current_proxy and state_manager:
-                state_manager.update_proxy_score(current_proxy, -20)
+                penalty = {
+                    'tunnel_fail': -60, 'refused': -60, 'ssl': -40,
+                    'aborted': -30, 'timeout': -25,
+                    'banned': -80, 'generic': -20,
+                }.get(post_submit_error_type, -20)
+                state_manager.update_proxy_score(current_proxy, penalty)
+                if post_submit_error_type in ('tunnel_fail', 'refused', 'ssl', 'aborted', 'banned'):
+                    state_manager.check_and_burn_bad_proxy(current_proxy, post_submit_error_type)
             if proxy_lease_manager and current_proxy:
                 try:
-                    proxy_lease_manager.ban_proxy(current_proxy, reason="aborted")
+                    proxy_lease_manager.ban_proxy(current_proxy, reason=post_submit_error_type)
                 except Exception:
                     pass
                 if username:
@@ -11321,12 +14340,37 @@ async def Login(client: httpx.Client, username: str, password: str, user_agent: 
             error_type = _classify_proxy_error(error_str)
             logger.error(f"[Login] Erro ({error_type}): {error_str[:120]}")
 
+            if error_type == 'transient_retry_403':
+                logger.info(
+                    f"[Login] {username}: HTTP 403 após retentativa POST /login (MNE) — "
+                    "proxy NÃO penalizado aqui (worker marca failed_retry_later)."
+                )
+                raise
+
+            if error_type == 'mne_generic_operation':
+                logger.info(
+                    f"[Login] {username}: MNE erro genérico de operação (JSON após POST) — "
+                    "sem penalização nem novo ciclo CAPTCHA aqui (worker gere fila/rejeição servidor)."
+                )
+                raise
+
+            if error_type == 'mne_challenge':
+                logger.info(
+                    f"[Login] {username}: resposta POST /login com desafio /ch/ (antibot) — "
+                    "proxy não penalizado; worker pode marcar falha recuperável."
+                )
+                raise
+
             # Penalização por tipo de erro
             penalty = {
                 'tunnel_fail': -60, 'refused': -60, 'ssl': -40,
                 'aborted': -20, 'timeout': -15,
                 'banned': -80, 'captcha': -20,
-                'site_unavailable': 0, 'generic': -10
+                'site_unavailable': 0,
+                'transient_retry_403': 0,
+                'mne_generic_operation': 0,
+                'mne_challenge': 0,
+                'generic': -10
             }.get(error_type, -10)
 
             if current_proxy and state_manager:
@@ -11492,6 +14536,10 @@ async def main(username, password, proxy_list, process_id: int = 0):
         total_login_slots = max_login_attempts + mne_unavailable_proxy_retries
         captcha_failure_count = 0
         mne_unavailable_count = 0
+        mne_challenge_outer_count = 0
+        login_max_mne_challenge_retries = max(
+            0, min(total_login_slots, _cfg_int("login_max_mne_challenge_retries", 1))
+        )
         
         new_client = None
         
@@ -11586,8 +14634,40 @@ async def main(username, password, proxy_list, process_id: int = 0):
                 )
                 raise
             except Exception as e:
+                if "login challenge:" in str(e).lower():
+                    if mne_challenge_outer_count >= login_max_mne_challenge_retries:
+                        logger.error(
+                            f"[main] {username}: desafio /ch/ repetido — limite "
+                            f"login_max_mne_challenge_retries={login_max_mne_challenge_retries} "
+                            f"atingido; não gastar mais CAPTCHA neste run ({str(e)[:160]})"
+                        )
+                        raise RuntimeError(
+                            f"MNE login challenge budget exhausted ({login_max_mne_challenge_retries} retries)"
+                        ) from e
+                    mne_challenge_outer_count += 1
+                    try:
+                        _ch_sl = float(
+                            (scraper_settings or {}).get(
+                                "login_challenge_retry_sleep_sec", 12.0
+                            )
+                            or 12.0
+                        )
+                    except Exception:
+                        _ch_sl = 12.0
+                    _ch_sl = max(5.0, min(120.0, _ch_sl))
+                    logger.warning(
+                        f"[main] {username}: desafio antibot /ch/ no POST /login — "
+                        f"pausa {_ch_sl:.0f}s e nova tentativa (sem rotação de chave CAPTCHA). "
+                        f"[{mne_challenge_outer_count}/{login_max_mne_challenge_retries}] "
+                        f"{str(e)[:120]}"
+                    )
+                    await asyncio.sleep(_ch_sl)
+                    continue
                 if _is_site_unavailable_error(str(e)) and mne_unavailable_count < mne_unavailable_proxy_retries:
                     mne_unavailable_count += 1
+                    pause_s = _mne_circuit_record_failure(
+                        f"login_pre_captcha user={username} error={str(e)[:160]}"
+                    )
                     _current_proxy = None
                     if proxy_lease_manager:
                         try:
@@ -11619,8 +14699,13 @@ async def main(username, password, proxy_list, process_id: int = 0):
                         f"[main] {username}: MNE devolveu 503/manutencao via "
                         f"{_proxy_safe_label(_current_proxy)}; tentando outro proxy "
                         f"({mne_unavailable_count}/{mne_unavailable_proxy_retries}) "
-                        f"apos {mne_unavailable_retry_sleep:.1f}s."
+                        f"apos {mne_unavailable_retry_sleep:.1f}s. "
+                        f"ddos_pause={'aberto '+str(int(pause_s))+'s' if pause_s else 'pendente'}"
                     )
+                    if pause_s > 0:
+                        raise RuntimeError(
+                            f"DDoSGuard abriu pausa global apos MNE 503/manutencao: {e}"
+                        ) from e
                     await asyncio.sleep(mne_unavailable_retry_sleep)
                     continue
                 if _login_fatal_skip_captcha_key_rotate(str(e)):
@@ -11747,7 +14832,7 @@ class WorkQueue:
         added = 0
         for row in rows:
             username = str(row.get("username", "")).strip()
-            status   = str(row.get("status", "")).strip().lower()
+            status   = _norm_csv_status(row.get("status", ""))
             if not username:
                 continue
             # Nao adicionar users ja completos, em progresso, ou bloqueados no site
@@ -11960,7 +15045,7 @@ def worker(proxy_chunk: List[str], process_id: int,
 
     # Inicializar globais do processo
     global state_manager
-    state_manager = StateManager()
+    state_manager = StateManager(settings_dict)
 
     global _PLAYWRIGHT_SEMAPHORE
     _PLAYWRIGHT_SEMAPHORE = None
@@ -11983,9 +15068,7 @@ def worker(proxy_chunk: List[str], process_id: int,
             df_seed = pd.read_csv(credentials_file_path, encoding='utf-8')
             if 'status' not in df_seed.columns:
                 df_seed['status'] = 'false'
-            df_seed['status'] = (
-                df_seed['status'].astype(str).str.strip().str.lower()
-            )
+            df_seed['status'] = df_seed['status'].map(_norm_csv_status)
             reclaimed = _reclaim_stale_processing_rows(df_seed, credentials_file_path)
             if reclaimed:
                 logger.info(
@@ -12195,6 +15278,9 @@ def worker(proxy_chunk: List[str], process_id: int,
                         )
 
                         if "403" in err_l or "proxy/ip banned" in err_l:
+                            _soft403_transient = (
+                                LOGIN_403_MARKER_TRANSIENT_RETRY in err_l
+                            )
                             _cp = None
                             if proxy_lease_manager:
                                 try:
@@ -12244,16 +15330,32 @@ def worker(proxy_chunk: List[str], process_id: int,
                                 final_status = 'false'
                                 continue
 
-                            if proxy_lease_manager and _cp:
-                                try:
-                                    proxy_lease_manager.ban_proxy(_cp, reason="403")
-                                except Exception as _ban403_err:
-                                    logger.warning(
-                                        f"[Process-{process_id}] Falha a aplicar ban 403 "
-                                        f"ao proxy de {username}: {_ban403_err}"
-                                    )
-                            state_manager.send_to_jail(username, duration_minutes=_jail_403)
-                            final_status = 'banned_403'
+                            _j403_tr = float(
+                                (scraper_settings or {}).get(
+                                    "global_throttle_minutes_on_403_transient_retry", 12.0
+                                )
+                            )
+                            if _soft403_transient:
+                                logger.warning(
+                                    f"[Process-{process_id}] {username}: HTTP 403 após retentativa "
+                                    "POST /login (MNE) — CSV failed_retry_later; proxy "
+                                    "não recebe ban duro (pode ser WAF/rate double-submit)."
+                                )
+                                state_manager.send_to_jail(
+                                    username, duration_minutes=_j403_tr
+                                )
+                                final_status = "failed_retry_later"
+                            else:
+                                if proxy_lease_manager and _cp:
+                                    try:
+                                        proxy_lease_manager.ban_proxy(_cp, reason="403")
+                                    except Exception as _ban403_err:
+                                        logger.warning(
+                                            f"[Process-{process_id}] Falha a aplicar ban 403 "
+                                            f"ao proxy de {username}: {_ban403_err}"
+                                        )
+                                state_manager.send_to_jail(username, duration_minutes=_jail_403)
+                                final_status = 'banned_403'
 
                         elif _is_recaptcha_quota_exhausted_msg(err):
                             if proxy_lease_manager:
@@ -12310,9 +15412,13 @@ def worker(proxy_chunk: List[str], process_id: int,
 
                         else:
                             if _is_site_unavailable_error(err):
+                                pause_s = _mne_circuit_record_failure(
+                                    f"user={username} error={err[:160]}"
+                                )
                                 logger.warning(
                                     f"[Process-{process_id}] {username}: MNE indisponível/manutenção "
-                                    "detectado — parar já e marcar blocked_site sem retries adicionais."
+                                    "detectado — parar já e marcar blocked_site sem retries adicionais. "
+                                    f"ddos_pause={'aberto '+str(int(pause_s))+'s' if pause_s else 'pendente'}"
                                 )
                             state_manager.send_to_jail(username, duration_minutes=_jail_blk)
                             final_status = 'blocked_site'
@@ -12320,19 +15426,44 @@ def worker(proxy_chunk: List[str], process_id: int,
                         break
 
                     if _is_server_login_rejection(err):
-                        logger.warning(
-                            f"[Process-{process_id}] {username} rejeitado pelo servidor; "
+                        if _server_rejection_requires_credential_recovery(err):
+                            final_status = 'credential_recovery_required'
+                            server_rejection_action = (
+                                "marcando credential_recovery_required; "
+                                "a conta precisa de recuperação/manual reset."
+                            )
+                            logger.warning(
+                                f"[Process-{process_id}] {username} rejeitado pelo servidor; "
+                                f"{server_rejection_action}"
+                            )
+                            break
+
+                        _outer_retry_generic = (
+                            _cfg_bool("login_full_retry_on_generic_operation_error", True)
+                            and attempt < max_user_attempts - 1
+                            and _is_outer_retryable_generic_mne_login_json(err)
+                        )
+                        if _outer_retry_generic:
+                            logger.warning(
+                                f"[Process-{process_id}] {username}: erro JSON genérico `/login` "
+                                f"(tentativa {attempt + 1}/{max_user_attempts}) — nova passagem "
+                                "completa (sessão+solve) antes de marcar falha persistente."
+                            )
+                            final_status = 'false'
+                            continue
+
+                        final_status = 'failed_retry_later'
+                        server_rejection_action = (
                             "pausando em failed_retry_later ate ajuste manual."
                         )
-                        # Cada vez que vemos esta mensagem genérica, o proxy
-                        # actualmente arrendado ganha 1 ponto. Quando vários
-                        # users seguidos são rejeitados pelo mesmo proxy, é
-                        # quase sempre o MNE a silenciar esse IP — banimos
-                        # localmente para parar de queimar CAPTCHA solves nele
-                        # (ver browser_error_reports/*_login_rejected_server_*
-                        # — o proxy 50.7.248.98 acumulou 20+ rejeições idênticas
-                        # com 4 utilizadores diferentes em 24h).
-                        if proxy_lease_manager:
+                        logger.warning(
+                            f"[Process-{process_id}] {username} rejeitado pelo servidor; "
+                            f"{server_rejection_action}"
+                        )
+                        # Só penalizar o proxy quando a rejeição é genérica /
+                        # compatível com rede. Respostas explícitas sobre
+                        # credenciais/conta não dizem nada sobre a qualidade do IP.
+                        if proxy_lease_manager and _server_rejection_points_to_proxy(err):
                             try:
                                 proxy_lease_manager.record_server_rejection(
                                     username, threshold=3
@@ -12342,7 +15473,11 @@ def worker(proxy_chunk: List[str], process_id: int,
                                     f"[Process-{process_id}] Falha a registar "
                                     f"server-rejection no PLM: {_q_err}"
                                 )
-                        final_status = 'failed_retry_later'
+                        else:
+                            logger.info(
+                                f"[Process-{process_id}] Rejeição de login não atribuída ao proxy "
+                                f"(provável conta/credenciais): {err[:180]}"
+                            )
                         break
 
                     final_status = 'false'
@@ -12396,12 +15531,15 @@ def worker(proxy_chunk: List[str], process_id: int,
         active_tasks: set = set()
         shutdown_requested = False
         last_csv_reload = 0.0
+        last_mne_health_probe = 0.0
         CSV_RELOAD_INTERVAL = 30.0  # recarrega CSV a cada 30s
 
         while True:
             try:
                 # ── Limpar tasks concluidas ───────────────────────────────────
                 active_tasks = {t for t in active_tasks if not t.done()}
+                if await _mne_circuit_sleep_if_open(f"process-{process_id}"):
+                    continue
 
                 # ── Reload do CSV para detetar novos users ────────────────────
                 now = time.time()
@@ -12412,9 +15550,7 @@ def worker(proxy_chunk: List[str], process_id: int,
                         )
                         if 'status' not in df_fresh.columns:
                             df_fresh['status'] = 'false'
-                        df_fresh['status'] = (
-                            df_fresh['status'].astype(str).str.strip().str.lower()
-                        )
+                        df_fresh['status'] = df_fresh['status'].map(_norm_csv_status)
                         rows = df_fresh.to_dict('records')
                         # Resetar known para permitir re-adicionar users que voltaram a pending
                         work_queue.reset_for_reload()
@@ -12434,6 +15570,16 @@ def worker(proxy_chunk: List[str], process_id: int,
                 if len(active_tasks) >= max_concurrency:
                     await asyncio.sleep(0.5)
                     continue
+
+                _ddos_enabled, _, _, _, _probe_interval = _mne_circuit_config()
+                if _ddos_enabled and now - last_mne_health_probe >= _probe_interval:
+                    last_mne_health_probe = now
+                    probe_proxy = proxy_chunk[0] if proxy_chunk else None
+                    if not await _mne_health_probe(
+                        probe_proxy, label=f"process-{process_id}"
+                    ):
+                        await asyncio.sleep(min(30.0, _probe_interval))
+                        continue
 
                 # ── Pedir proximo user da queue ───────────────────────────────
                 username = work_queue.claim_next(timeout_s=check_interval)
@@ -12975,7 +16121,7 @@ def precheck_mne_reachable_proxies(proxy_list: List[str], settings: Dict) -> Lis
         max_checks = int(settings.get("mne_proxy_precheck_max", 12) or 12)
     except (TypeError, ValueError):
         max_checks = 12
-    max_checks = max(1, min(max_checks, len(proxy_list)))
+    max_checks = max(25, min(max_checks, len(proxy_list)))
 
     try:
         timeout = float(settings.get("mne_proxy_precheck_timeout_sec", 12) or 12)
@@ -13162,7 +16308,7 @@ def validate_files_and_config(working_dir: str, scraper_settings: Dict) -> tuple
 
     if 'status' not in df.columns:
         df['status'] = 'False'
-    df['status'] = df['status'].astype(str).str.strip().str.lower()
+    df['status'] = df['status'].map(_norm_csv_status)
 
     return proxy_list, df, credentials_file
 
@@ -13193,6 +16339,7 @@ def main_execution_continuous():
         logger.info(f"Iniciando Scraper com Dynamic Work Queue em: {WORKING_DIR}")
         _cleanup_orphaned_bot_processes(scraper_settings)
         _cleanup_orphaned_playwright_browsers(scraper_settings)
+        _cleanup_run_owned_browser_processes(scraper_settings)
 
         # ── Carregar proxies e CSV ────────────────────────────────────────────
         proxy_list, df, credentials_file = validate_files_and_config(
@@ -13216,7 +16363,7 @@ def main_execution_continuous():
         _known_statuses = (
             "false", "pending", "<empty>", "processing",
             "failed_retry_later", "blocked_site", "banned_403",
-            "recaptcha_quota", "success", "true",
+            "recaptcha_quota", "success", "true", "credential_recovery_required",
         )
         summary_parts = [
             f"queue_elegiveis={pending_users}",
@@ -13230,6 +16377,7 @@ def main_execution_continuous():
             f"blocked_site={status_counts.get('blocked_site', 0)}",
             f"success={status_counts.get('success', 0)}",
             f"true={status_counts.get('true', 0)}",
+            f"credential_recovery_required={status_counts.get('credential_recovery_required', 0)}",
         ]
         other_statuses = {
             key: value for key, value in status_counts.items()
@@ -13254,16 +16402,16 @@ def main_execution_continuous():
 
         # ── Inicializar Work Queue e carregar users pendentes ─────────────────
         _r_init = None
-        try:
-            _r_init = redis.Redis(
-                host=os.getenv('REDIS_HOST', 'localhost'),
-                port=int(os.getenv('REDIS_PORT', 6379)),
-                decode_responses=True
+        _r_init, _redis_target, _redis_err = _connect_redis(scraper_settings)
+        if _r_init:
+            logger.info(f"Redis conectado ({_redis_target}).")
+        elif _redis_err:
+            logger.warning(
+                f"Redis configurado mas indisponivel em {_redis_target} ({_redis_err}) — "
+                "usando queue in-memory"
             )
-            _r_init.ping()
-        except Exception as _re:
-            logger.warning(f"Redis nao disponivel ({_re}) — usando queue in-memory")
-            _r_init = None
+        else:
+            logger.info("Redis desativado; usando queue in-memory")
 
         wq_init = WorkQueue(redis_client=_r_init)
         _redis_available = _r_init is not None
@@ -13459,6 +16607,16 @@ def main_execution_continuous():
             except TypeError:
                 executor.shutdown(wait=False)
             try:
+                cleaned_owned = _cleanup_run_owned_browser_processes(scraper_settings)
+                if cleaned_owned:
+                    logger.info(
+                        f"[Shutdown] Browser processes do run removidos={cleaned_owned}."
+                    )
+            except Exception as browser_cleanup_err:
+                logger.warning(
+                    f"[Shutdown] Falha a limpar browsers do run: {browser_cleanup_err}"
+                )
+            try:
                 cleaned = _cleanup_orphaned_playwright_browsers(scraper_settings)
                 if cleaned:
                     logger.info(
@@ -13491,6 +16649,18 @@ if __name__ == "__main__":
     import multiprocessing as _mp_bootstrap
     _mp_bootstrap.set_start_method('spawn', force=True)
     _install_graceful_signal_handlers()
+
+    if any(arg.lower() in ("--stop-bots", "stop-bots", "--stop") for arg in sys.argv[1:]):
+        try:
+            setting_file_path = os.path.join(WORKING_DIR, 'config1.toml')
+            _stop_settings = {}
+            if os.path.exists(setting_file_path):
+                with open(setting_file_path, 'rb') as _stop_f:
+                    _stop_settings = tomllib.load(_stop_f)
+        except Exception:
+            _stop_settings = {}
+        stop_running_bot_processes(_stop_settings)
+        sys.exit(0)
     
     # Executar a funcao principal
     try:

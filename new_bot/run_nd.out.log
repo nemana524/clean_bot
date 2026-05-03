@@ -1,0 +1,8 @@
+[Redis] desativado; usando estado local/in-memory.
+[Process-0] ? Iniciado | proxies=1 | [WQ] 1 users pendentes na queue
+[Process-0] [PLM] 0 em uso | 0 banidos (memory)
+[TLSClient] ? Preflight HTTP status=200 ja3=chrome124 cookies=['cookiesession1']
+[TLSClient] ? Preflight HTTP status=200 ja3=chrome124 cookies=['cookiesession1']
+[TLSClient] ? Preflight HTTP status=200 ja3=chrome124 cookies=['cookiesession1']
+[TLSClient] ? Preflight HTTP status=200 ja3=chrome124 cookies=['cookiesession1']
+[TLSClient] ? Preflight HTTP status=200 ja3=chrome124 cookies=['cookiesession1']

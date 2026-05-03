@@ -1,0 +1,52 @@
+[32m[Proc-0] 04:18:37 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:18:37 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:18:38 - INFO     - [MNE Precheck] Testing 11/11 proxy exits against /VistosOnline before claiming users.[0m
+[32m[Proc-0] 04:18:45 - INFO     - [MNE Precheck] \u2705 64.52.30.114:6801:Mylist1234 exit_ip=64.52.30.114 status=200[0m
+[33m[Proc-0] 04:18:47 - WARNING  - [MNE Precheck] \u274c 45.56.180.231:8465:Mylist1234 exit_ip=45.56.180.231 erro=Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.s[0m
+[32m[Proc-0] 04:18:50 - INFO     - [MNE Precheck] \u2705 9.142.43.8:5178:Mylist1234 exit_ip=9.142.43.8 status=200[0m
+[32m[Proc-0] 04:18:56 - INFO     - [MNE Precheck] \u2705 159.148.236.10:6216:Mylist1234 exit_ip=159.148.236.10 status=200[0m
+[32m[Proc-0] 04:18:58 - INFO     - [MNE Precheck] \u2705 82.23.97.171:7897:Mylist1234 exit_ip=82.23.97.171 status=200[0m
+[32m[Proc-0] 04:18:59 - INFO     - [MNE Precheck] \u2705 104.253.248.206:5985:Mylist1234 exit_ip=104.253.248.206 status=200[0m
+[32m[Proc-0] 04:19:02 - INFO     - [MNE Precheck] \u2705 9.142.203.151:6318:Mylist1234 exit_ip=9.142.203.151 status=200[0m
+[32m[Proc-0] 04:19:05 - INFO     - [MNE Precheck] \u2705 9.142.199.58:5225:Mylist1234 exit_ip=9.142.199.58 status=200[0m
+[1;31m[Proc-0] 04:19:06 - CRITICAL - \U0001f6a8 Excecao critica: [MNE Precheck] Proxy provider devolveu 402/quota antes de chegar ao MNE. A bandwidth/allowance do Webshare parece esgotada ou o plano ainda nao permite tunnel. Primeiro proxy afectado: 146.70.40.94:80:Mylist...-216@unknown. Reponha bandwidth e tente novamente.[0m
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\requests\session.py", line 732, in _request_once
+    c.perform()
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\curl.py", line 505, in perform
+    self._check_error(ret, "perform")
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\curl.py", line 269, in _check_error
+    raise error
+curl_cffi.curl.CurlError: Failed to perform, curl: (56) CONNECT tunnel failed, response 402. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot\visa_bot.py", line 15141, in precheck_mne_reachable_proxies
+    resp = curl_requests.get(
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\requests\__init__.py", line 148, in get
+    return request(method="GET", url=url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\requests\__init__.py", line 140, in request
+    return s.request(method=method, url=url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\requests\session.py", line 795, in request
+    return self._request_once(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\curl_cffi\requests\session.py", line 739, in _request_once
+    raise error(str(e), e.code, rsp) from e
+curl_cffi.requests.exceptions.ProxyError: Failed to perform, curl: (56) CONNECT tunnel failed, response 402. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot\visa_bot.py", line 15324, in main_execution_continuous
+    proxy_list, df, credentials_file = validate_files_and_config(
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot\visa_bot.py", line 15266, in validate_files_and_config
+    proxy_list = precheck_mne_reachable_proxies(proxy_list, scraper_settings)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot\visa_bot.py", line 15163, in precheck_mne_reachable_proxies
+    raise ValueError(
+ValueError: [MNE Precheck] Proxy provider devolveu 402/quota antes de chegar ao MNE. A bandwidth/allowance do Webshare parece esgotada ou o plano ainda nao permite tunnel. Primeiro proxy afectado: 146.70.40.94:80:Mylist...-216@unknown. Reponha bandwidth e tente novamente.

@@ -1,0 +1,85 @@
+[32m[Proc-0] 04:48:00 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:48:00 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:48:01 - INFO     - [SOAX API] Geo OK: country=pt, conn_type=wifi, regions=20.[0m
+[32m[Proc-0] 04:48:01 - INFO     - [SOAX] Loaded 1 exact proxy session (host=proxy.soax.com:5000, package=335959, sticky=True, length=300s).[0m
+[32m[Proc-0] 04:48:01 - INFO     - LOADED 1 VALID PROXIES.[0m
+[32m[Proc-0] 04:48:01 - INFO     - \U0001f4cb 9 utilizadores carregados do CSV.[0m
+[32m[Proc-0] 04:48:01 - INFO     - \U0001f4ca CSV status summary: queue_elegiveis=1 | false=1 | pending=0 | empty=0 | failed_retry_later=3 | processing=0 | banned_403=0 | recaptcha_quota=0 | blocked_site=0 | success=0 | true=5 | credential_recovery_required=0[0m
+[32m[Proc-0] 04:48:01 - INFO     - Redis desativado; usando queue in-memory[0m
+[32m[Proc-0] 04:48:01 - INFO     - \U0001f4e5 1 users adicionados a Work Queue. [WQ] 1 users pendentes na queue[0m
+[32m[Proc-0] 04:48:01 - INFO     - \u2699\ufe0f Workers: 1 (cpu=12, users_pendentes=1, max_cfg=1)[0m
+[32m[Proc-0] 04:48:01 - INFO     - \U0001f50c Proxy chunks: [1] (1 alocados para chunking, 1 na config)[0m
+[32m[Proc-0] 04:48:01 - INFO     - [OK] 1 workers iniciados em modo Dynamic Work Queue.[0m
+[32m[Proc-0] 04:48:03 - INFO     - [Process-0] Sem Redis: 1 utilizadores pendentes carregados do CSV para fila local.[0m
+[32m[Proc-0] 04:48:03 - INFO     - [Process-0] \U0001f3c3 Worker loop iniciado (concurrency=1)[0m
+[33m[Proc-0] 04:48:15 - WARNING  - [DDoSGuard] Health FAIL (process-0): status=0 text='Failed to perform, curl: (28) Connection timed out after 12001 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.' pause=not yet[0m
+[32m[Proc-0] 04:48:45 - INFO     - [Process-0] \u25b6\ufe0f Task iniciada: gilso111 (1/1 slots ocupados)[0m
+[32m[Proc-0] 04:48:45 - INFO     - [CSV Update] Updated gilso111 -> 'processing'[0m
+[32m[Proc-0] 04:48:45 - INFO     - [Process-0] \U0001f504 Claimed: gilso111[0m
+[32m[Proc-0] 04:48:46 - INFO     - [Login] Attempt 1/5 (Using Key Index 0, Process ID 0, mne_503_retries=0/4)[0m
+[32m[Proc-0] 04:48:46 - INFO     - [Session] \U0001f512 Proxy exclusivo adquirido: gilso111 -> proxy.soax.com:5000:packag...-300[0m
+[32m[Proc-0] 04:48:47 - INFO     - [Session] \u2705 Proxy OK: proxy.soax.com:5000:packag...-300 | exit_ip=87.196.219.120 | validator=https://api.ipify.org?format=json | lat=644ms | user=gilso111[0m
+[32m[Proc-0] 04:48:47 - INFO     - \U0001f4b0 Saldo anti-captcha: $5.7549[0m
+[32m[Proc-0] 04:48:48 - INFO     - \U0001f4b0 Saldo 2captcha: $18.0708[0m
+[32m[Proc-0] 04:48:48 - INFO     - \U0001f4b0 Saldo capmonster: $18.6852[0m
+[32m[Proc-0] 04:48:48 - INFO     - \U0001f4b0 Saldo capsolver: $15.1258[0m
+[32m[Proc-0] 04:48:48 - INFO     - [Login] Attempting login via playwright (retries remaining: 1, proxy: proxy.soax.com)...[0m
+[32m[Proc-0] 04:48:49 - INFO     - [Playwright] Initializing browser (Ghost Mode Activated)...[0m
+[32m[Proc-0] 04:49:05 - INFO     - [TLSClient] Preflight: status=0 cookies=[][0m
+[32m[Proc-0] 04:49:05 - INFO     - [Playwright] Launching REAL Chrome/Edge browser...[0m
+[32m[Proc-0] 04:49:05 - INFO     - [Playwright] \u2705 Navegador iniciado: chrome[0m
+[32m[Proc-0] 04:49:05 - INFO     - [TLSClient] Cookie injection disabled; Playwright will establish its own session cookies on the browser proxy connection.[0m
+[32m[Proc-0] 04:49:05 - INFO     - [TLSClient] \u2705 stealth_context criado[0m
+[32m[Proc-0] 04:49:05 - INFO     - [Playwright] User-Agent Real em uso: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36[0m
+[32m[Proc-0] 04:49:05 - INFO     - [BrowserPool] Contexto guardado no pool para proxy.soax.com[0m
+[32m[Proc-0] 04:49:05 - INFO     - [Playwright] \U0001f47b GhostMode Ativado: Intel Iris OpenGL Engine | CPU=16c RAM=8GB platform=Win32 [workstation-hi][0m
+[32m[Proc-0] 04:49:05 - INFO     - [Playwright] Visiting main page to establish session cookies...[0m
+[33m[Proc-0] 04:49:21 - WARNING  - [Playwright] Main page visit failed (non-critical): Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/VistosOnline/
+Call log:
+  - navigating to "https://pedidodevistos.mne.gov.pt/VistosOnline/", waiting until "domcontentloaded"
+[0m
+[32m[Proc-0] 04:49:21 - INFO     - [Playwright] Aguardando cookies de sessão (_USER_CONSENT PoW)... require_consent=True, budget_sec=45[0m
+[32m[Proc-0] 04:49:21 - INFO     - [Playwright] Aguardando cookies... (0.0s) — session=False, consent_pow=False[0m
+[32m[Proc-0] 04:49:29 - INFO     - [Playwright] Aguardando cookies... (8.0s) — session=False, consent_pow=False[0m
+[32m[Proc-0] 04:49:38 - INFO     - [Playwright] Aguardando cookies... (16.0s) — session=False, consent_pow=False[0m
+[32m[Proc-0] 04:49:47 - INFO     - [Playwright] Aguardando cookies... (24.0s) — session=False, consent_pow=False[0m
+[32m[Proc-0] 04:49:55 - INFO     - [Playwright] Aguardando cookies... (32.0s) — session=False, consent_pow=False[0m
+[32m[Proc-0] 04:50:04 - INFO     - [Playwright] Aguardando cookies... (40.0s) — session=False, consent_pow=False[0m
+[33m[Proc-0] 04:50:09 - WARNING  - [Playwright] \u26a0\ufe0f Timeout aguardando cookie PoW. require_consent=True, presentes=[], _USER_CONSENT(path /)=False[0m
+[32m[Proc-0] 04:50:09 - INFO     - [Playwright] A continuar para login apesar do PoW em atraso — o servidor pode ainda aceitar (ou falhar depois).[0m
+[32m[Proc-0] 04:50:09 - INFO     - [Playwright] Navigating to login page: https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT[0m
+[32m[Proc-0] 04:50:09 - INFO     - [Playwright] Navegando para login (Tentativa 1/3) - MODO TURBO...[0m
+[33m[Proc-0] 04:50:25 - WARNING  - [Playwright] Falha na navegação. Tentando novamente em 3s... Erro: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT
+Call log:
+  - navigating to "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT", waiting until "domcontentloaded"
+[0m
+[33m[Proc-0] 04:50:28 - WARNING  - [Playwright] Erro de conexão detectado. Reiniciando página...[0m
+[32m[Proc-0] 04:50:28 - INFO     - [Playwright] \U0001f47b GhostMode Re-Ativado (Recovery): ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11) | hw=workstation-hi[0m
+[32m[Proc-0] 04:50:28 - INFO     - [Playwright] Navegando para login (Tentativa 2/3) - MODO TURBO...[0m
+[33m[Proc-0] 04:50:43 - WARNING  - [Playwright] Falha na navegação. Tentando novamente em 6s... Erro: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT
+Call log:
+  - navigating to "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT", waiting until "domcontentloaded"
+[0m
+[33m[Proc-0] 04:50:49 - WARNING  - [Playwright] Erro de conexão detectado. Reiniciando página...[0m
+[32m[Proc-0] 04:50:49 - INFO     - [Playwright] \U0001f47b GhostMode Re-Ativado (Recovery): ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0, D3D11) | hw=workstation-hi[0m
+[32m[Proc-0] 04:50:49 - INFO     - [Playwright] Navegando para login (Tentativa 3/3) - MODO TURBO...[0m
+[31m[Proc-0] 04:51:04 - ERROR    - [Playwright Internal] Erro critico: Navegação falhou após 3 tentativas: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT
+Call log:
+  - navigating to "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT", waiting until "domcontentloaded"
+[0m
+[33m[Proc-0] 04:51:04 - WARNING  - [BrowserCapture] local_debug_artifacts=false; skip artifact capture (reason=critical_playwright, url=about:blank)[0m
+[32m[Proc-0] 04:51:04 - INFO     - [BrowserPool] Contexto invalidado para proxy.soax.com[0m
+[31m[Proc-0] 04:51:04 - ERROR    - [Login] Erro (tunnel_fail): Navegação falhou após 3 tentativas: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/Vi[0m
+[33m[Proc-0] 04:51:04 - WARNING  - [Proxy] \U0001f525 Proxy proxy.soax.com banido (tunnel_fail)[0m
+[32m[Proc-0] 04:51:04 - INFO     - [Proxy] Erro de conexao — rotacionando proxy para gilso111...[0m
+[31m[Proc-0] 04:51:04 - ERROR    - [Login] All login attempts failed[0m
+[33m[Proc-0] 04:51:04 - WARNING  - Login attempt 1 returned None. Rotating API key...[0m
+[31m[Proc-0] 04:51:04 - ERROR    - Login failed after trying configured login/proxy attempts. Marking as failed.[0m
+[33m[Proc-0] 04:51:04 - WARNING  - [Process-0] \u26a0\ufe0f Tentativa 1/1 falhou: gilso111[0m
+[33m[Proc-0] 04:51:04 - WARNING  - [Process-0] gilso111: max_user_attempts esgotado; marcando failed_retry_later para nao re-enfileirar no mesmo run.[0m
+[32m[Proc-0] 04:51:04 - INFO     - [CSV Update] Updated gilso111 -> 'failed_retry_later'[0m
+[32m[Proc-0] 04:51:04 - INFO     - [Process-0] \U0001f513 Proxy libertado: gilso111 (status=failed_retry_later)[0m
+[32m[Proc-0] 04:51:04 - INFO     - [Process-0] \u2705 Task finalizada: gilso111 (0/1 slots ocupados)[0m
+[33m[Proc-0] 04:51:16 - WARNING  - [DDoSGuard] Health FAIL (process-0): status=0 text='Failed to perform, curl: (28) Connection timed out after 12001 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.' pause=not yet[0m
+[33m[Proc-0] 04:52:16 - WARNING  - [DDoSGuard] Health FAIL (process-0): status=0 text='Failed to perform, curl: (28) Connection timed out after 12002 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.' pause=opened 900s[0m
+[33m[Proc-0] 04:52:46 - WARNING  - [DDoSGuard] Circuit breaker aberto (process-0): pausando 870s antes de novo acesso ao MNE. motivo=health_probe status=0 text=Failed to perform, curl: (28) Connection timed out after 12002 milliseconds. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.[0m

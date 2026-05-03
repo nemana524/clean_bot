@@ -1,0 +1,121 @@
+[32m[Proc-0] 04:08:53 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:08:53 - INFO     - Iniciando Scraper com Dynamic Work Queue em: C:\Users\Administrator\Desktop\New folder\clean_bot\new_bot[0m
+[32m[Proc-0] 04:08:55 - INFO     - [SOAX API] Geo OK: country=pt, conn_type=wifi, regions=20.[0m
+[32m[Proc-0] 04:08:55 - INFO     - [SOAX] Loaded 1 exact proxy session (host=proxy.soax.com:5000, package=335959, sticky=True, length=300s).[0m
+[32m[Proc-0] 04:08:55 - INFO     - [MNE Precheck] Testing 1/1 proxy exits against /VistosOnline before claiming users.[0m
+[32m[Proc-0] 04:08:56 - INFO     - [MNE Precheck] \u2705 proxy.soax.com:5000:packag...-300 exit_ip=109.49.65.104 status=200[0m
+[32m[Proc-0] 04:08:56 - INFO     - [MNE Precheck] 1 proxy(s) reached MNE; using only those for this run.[0m
+[32m[Proc-0] 04:08:56 - INFO     - LOADED 1 VALID PROXIES.[0m
+[32m[Proc-0] 04:08:56 - INFO     - \U0001f4cb 1 utilizadores carregados do CSV.[0m
+[32m[Proc-0] 04:08:56 - INFO     - \U0001f4ca CSV status summary: queue_elegiveis=1 | false=1 | pending=0 | empty=0 | failed_retry_later=0 | processing=0 | banned_403=0 | recaptcha_quota=0 | blocked_site=0 | success=0 | true=0 | credential_recovery_required=0[0m
+[32m[Proc-0] 04:08:56 - INFO     - Redis desativado; usando queue in-memory[0m
+[32m[Proc-0] 04:08:56 - INFO     - \U0001f4e5 1 users adicionados a Work Queue. [WQ] 1 users pendentes na queue[0m
+[32m[Proc-0] 04:08:56 - INFO     - \u2699\ufe0f Workers: 1 (cpu=12, users_pendentes=1, max_cfg=1)[0m
+[32m[Proc-0] 04:08:56 - INFO     - \U0001f50c Proxy chunks: [1] (1 alocados para chunking, 1 na config)[0m
+[32m[Proc-0] 04:08:56 - INFO     - [OK] 1 workers iniciados em modo Dynamic Work Queue.[0m
+[32m[Proc-0] 04:08:57 - INFO     - [Process-0] Sem Redis: 1 utilizadores pendentes carregados do CSV para fila local.[0m
+[32m[Proc-0] 04:08:57 - INFO     - [Process-0] \U0001f3c3 Worker loop iniciado (concurrency=1)[0m
+[32m[Proc-0] 04:08:58 - INFO     - [Process-0] \u25b6\ufe0f Task iniciada: tomasjins (1/1 slots ocupados)[0m
+[32m[Proc-0] 04:08:58 - INFO     - [CSV Update] Updated tomasjins -> 'processing'[0m
+[32m[Proc-0] 04:08:58 - INFO     - [Process-0] \U0001f504 Claimed: tomasjins[0m
+[32m[Proc-0] 04:08:59 - INFO     - [Login] Attempt 1/5 (Using Key Index 0, Process ID 0, mne_503_retries=0/4)[0m
+[32m[Proc-0] 04:08:59 - INFO     - [Session] \U0001f512 Proxy exclusivo adquirido: tomasjins -> proxy.soax.com:5000:packag...-300[0m
+[32m[Proc-0] 04:09:00 - INFO     - [Session] \u2705 Proxy OK: proxy.soax.com:5000:packag...-300 | exit_ip=109.49.65.104 | validator=https://api.ipify.org?format=json | lat=383ms | user=tomasjins[0m
+[32m[Proc-0] 04:09:00 - INFO     - \U0001f4b0 Saldo anti-captcha: $5.7599[0m
+[32m[Proc-0] 04:09:00 - INFO     - \U0001f4b0 Saldo 2captcha: $18.0736[0m
+[32m[Proc-0] 04:09:01 - INFO     - \U0001f4b0 Saldo capmonster: $18.7732[0m
+[32m[Proc-0] 04:09:01 - INFO     - \U0001f4b0 Saldo capsolver: $15.1268[0m
+[32m[Proc-0] 04:09:01 - INFO     - [Login] Attempting login via playwright (retries remaining: 1, proxy: proxy.soax.com)...[0m
+[32m[Proc-0] 04:09:02 - INFO     - [Playwright] Initializing browser (Ghost Mode Activated)...[0m
+[32m[Proc-0] 04:09:03 - INFO     - [TLSClient] Preflight: status=200 cookies=['Vistos_sid', 'cookiesession1'][0m
+[32m[Proc-0] 04:09:03 - INFO     - [Playwright] Launching REAL Chrome/Edge browser...[0m
+[32m[Proc-0] 04:09:03 - INFO     - [Playwright] \u2705 Navegador iniciado: chrome[0m
+[32m[Proc-0] 04:09:03 - INFO     - [TLSClient] Cookie injection disabled; Playwright will establish its own session cookies on the browser proxy connection.[0m
+[32m[Proc-0] 04:09:03 - INFO     - [TLSClient] \u2705 stealth_context criado[0m
+[32m[Proc-0] 04:09:03 - INFO     - [Playwright] User-Agent Real em uso: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36[0m
+[32m[Proc-0] 04:09:03 - INFO     - [BrowserPool] Contexto guardado no pool para proxy.soax.com[0m
+[32m[Proc-0] 04:09:03 - INFO     - [Playwright] \U0001f47b GhostMode Ativado: ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11) | CPU=16c RAM=8GB platform=Win32 [workstation-hi][0m
+[32m[Proc-0] 04:09:03 - INFO     - [Playwright] Visiting main page to establish session cookies...[0m
+[32m[Proc-0] 04:09:05 - INFO     - [Playwright] Main page loaded (status: 200)[0m
+[32m[Proc-0] 04:09:05 - INFO     - [Playwright] Aguardando cookies de sessão completos (_USER_CONSENT PoW)...[0m
+[32m[Proc-0] 04:09:05 - INFO     - [Playwright] \u2705 Sessão pronta (sem PoW cookie visível): 2 cookies (['Vistos_sid', 'cookiesession1'])[0m
+[32m[Proc-0] 04:09:05 - INFO     - [Playwright] Navigating to login page: https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT[0m
+[32m[Proc-0] 04:09:05 - INFO     - [Playwright] Navegando para login (Tentativa 1/3) - MODO TURBO...[0m
+[32m[Proc-0] 04:09:07 - INFO     - [Playwright] \u2705 Página de login pronta![0m
+[32m[Proc-0] 04:09:07 - INFO     - [Playwright] Current page URL: https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT (navigation took 1.69s)[0m
+[32m[Proc-0] 04:09:07 - INFO     - [Playwright] Captured 2 cookies from initial page load[0m
+[32m[Proc-0] 04:09:07 - INFO     - [Playwright] Checking if reCAPTCHA widget is present on authentication page...[0m
+[32m[Proc-0] 04:09:07 - INFO     - [Pipeline] \u2705 CAPTCHA detectado — preenchendo formulario antes do solver...[0m
+[32m[Proc-0] 04:09:08 - INFO     - [Pipeline] Form fill a correr em paralelo com CAPTCHA solver...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Pipeline] \u2705 Form fill concluído em 3.66s[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Pipeline] \u2705 Form fill concluído em 4.98s; aguardando readiness do reCAPTCHA antes do solver.[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Form filling took 3.66s[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Short settle after form interaction...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Waiting for reCAPTCHA widget...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] \u2705 reCAPTCHA widget ready[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Widget check 1/5: grecaptcha=True, iframe=True[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Widget check attempt 1/5: grecaptcha=True, function=False, iframe=True, found=True[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] \u2705 reCAPTCHA widget detected and ready! (Widget ID: 0, iframes: 2)[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Site key: 6LdOB9crAAAAADT4RFru...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] CAPTCHA widget detected but solving not started yet, starting now...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Playwright] Waiting for CAPTCHA solving to complete...[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] websiteURL para task: https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] enterprise pageAction para task: LOGIN_EVISA[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] proxyAddress SOAX: 172.255.96.36 (4 IPv4 candidato(s) para Anti-Captcha fallback; host=proxy.soax.com)[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] SOAX/superproxy: IPv4 efémero 172.255.96.36:5000 (credenciais = browser; primeiro edge de proxy.soax.com; normal com hostname rotativo).[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] Login SOAX + CapMonster configurado: Anti-Captcha/2Captcha/CapSolver não participam nesta corrida por política (`captcha_skip_soax_custom_proxy_solvers_on_login`). Motivo habitual: ERROR_PROXY_CONNECT_REFUSED dos workers externos aos IPs edge SOAX (não é bug do bot). A resolver só via CapMonster (proxyless) como neste fluxo.[0m
+[32m[Proc-0] 04:09:12 - INFO     - [Captcha] Step 1/2: Race (capmonster) em paralelo...[0m
+[32m[Proc-0] 04:09:13 - INFO     - [CaptchaBalance] before capmonster: $18.7732[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Captcha] \u2705 Solved: capmonster (WINNER dual-service)[0m
+[32m[Proc-0] 04:09:46 - INFO     - [CaptchaBalance] after capmonster: $18.7722 (delta=-0.0010)[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] CAPTCHA token received (2489 chars)[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] \u2705 CAPTCHA solver devolveu token em 33.8s (idade ao receber=0.0s, elapsed total desde início do login=45.1s) — injecting token...[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] Verifying grecaptcha is available before token injection...[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] grecaptcha verified, ready for injection[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] captchaWidget após solver: fonte=default_0_grecaptcha_ready; id=0. (Isto apenas alinha JS com o POST; erro de servidor continua visível nos logs/error se o /login falhar.)[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] Injecting solved CAPTCHA token...[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] CAPTCHA token injected (length: 2489) (injection took 0.04s)[0m
+[32m[Proc-0] 04:09:46 - INFO     - [Playwright] CAPTCHA token ready; attempted visual checkmark sync: mark_ok=True[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] \u2705 CAPTCHA completion state ready before submit: token_len=2489 frame_checked=True container_checked=True[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] CAPTCHA completion gate passed: {'token_length': 2489, 'textarea_length': 2489, 'container_checked': True, 'captcha_error_visible': False, 'iframe_count': 2, 'frame_checked': True, 'frame_seen': True, 'mark_attempted': True, 'mark_ok': False}[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Time since CAPTCHA received: 0.63s[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Total time so far: 45.8s, CAPTCHA-to-submit: 0.6s[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Interceptação do POST /login configurada abaixo (log ou override de headers)[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Fast pre-submit readiness check...[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Fast pre-submit: user_ok=True pass_ok=True captcha_len=2489 src=enterprise jquery=True button_visible=True button_enabled=True[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Immediate submit path armed — avoiding legacy re-check loops.[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Injecting hook to capture login AJAX response...[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] POST /login — headers nativos (login_post_header_override=OFF)[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] [submit-count] Click #1/3 no botão de login (modo retentativa se MNE devolver erro genérico).[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] [submit-count] POST /login #1 capturado pela rede (esperado: exactamente 1).[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Login request captured: https://pedidodevistos.mne.gov.pt/VistosOnline/login (POST)[0m
+[32m[Proc-0] 04:09:47 - INFO     - [BrowserPOSTAudit] fields={'username': {'present': True, 'len': 9, 'sha16': '0cbeffc61e16eadf'}, 'password': {'present': True, 'len': 18, 'sha16': 'cd819944871a59f2'}, 'captchaResponse': {'present': True, 'len': 2489, 'sha16': '0d6927fd7dea9bdb'}, 'language': {'present': True, 'len': 2, 'sha16': '169b032adf2ab80f'}, 'rgpd': {'present': True, 'len': 1, 'sha16': '18f5384d58bcb1bb'}}[0m
+[32m[Proc-0] 04:09:47 - INFO     - [BrowserPOSTAudit] headers={'content_type': 'application/x-www-form-urlencoded; charset=UTF-8', 'origin': 'https://pedidodevistos.mne.gov.pt', 'referer': 'https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT', 'x_requested_with': 'XMLHttpRequest', 'sec_fetch_site': '', 'cookie_has_vistos_sid': True, 'cookie_has_cookiesession1': True}[0m
+[32m[Proc-0] 04:09:47 - INFO     - [BrowserPOSTAudit] expected_match: user=True pass_len=True captcha_len=2489[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Login POST: 2573 chars, captcha len=2489[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] Login POST fields: user_ok=True pass_len_ok=True language=PT rgpd=Y[0m
+[32m[Proc-0] 04:09:47 - INFO     - [Playwright] [submit-count] Click #1 concluído. Aguardando POST /login na rede...[0m
+[32m[Proc-0] 04:09:51 - INFO     - [Playwright] Login response: status=200, URL=https://pedidodevistos.mne.gov.pt/VistosOnline/login[0m
+[32m[Proc-0] 04:09:51 - INFO     - [Playwright] Login response seen; waiting for AJAX body capture before deciding success/failure.[0m
+[32m[Proc-0] 04:09:51 - INFO     - [Playwright] \u2705 Resposta AJAX Capturada: Status 200[0m
+[32m[Proc-0] 04:09:51 - INFO     - [Playwright] \U0001f4cb Resposta do servidor (JSON): {'type': 'error', 'description': 'Foi encontrado um erro ao executar a operação.'}[0m
+[33m[Proc-0] 04:09:51 - WARNING  - [Playwright] MNE devolveu erro genérico de operação (HTTP 200) — pode ser sobrecarga/back-end. Novo POST /login com o MESMO token CAPTCHA após backoff (tentativa_extra 1/2; sem novo solve).[0m
+[32m[Proc-0] 04:10:07 - INFO     - [Playwright] [submit-count] Click #2/3 no botão de login (modo retentativa se MNE devolver erro genérico).[0m
+[32m[Proc-0] 04:10:17 - INFO     - [Playwright] Botão Iniciar Sessão ainda disabled — reactivação controlada para retentativa MNE.[0m
+[32m[Proc-0] 04:10:18 - INFO     - [Playwright] [submit-count] POST /login #2 (retentativa MNE erro genérico / instabilidade; esperado).[0m
+[32m[Proc-0] 04:10:18 - INFO     - [Playwright] Login POST: 2573 chars, captcha len=2489[0m
+[32m[Proc-0] 04:10:18 - INFO     - [Playwright] Login POST fields: user_ok=True pass_len_ok=True language=PT rgpd=Y[0m
+[32m[Proc-0] 04:10:18 - INFO     - [Playwright] [submit-count] Click #2 concluído. Aguardando POST /login na rede...[0m
+[31m[Proc-0] 04:10:22 - ERROR    - [Playwright] \u274c BANIMENTO TOTAL (403). IP Bloqueado.[0m
+[31m[Proc-0] 04:10:22 - ERROR    - [Playwright Internal] Erro critico: HTTP 403 - Proxy/IP Banned[0m
+[33m[Proc-0] 04:10:22 - WARNING  - [BrowserCapture] local_debug_artifacts=false; skip artifact capture (reason=critical_playwright, url=https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp?language=PT)[0m
+[32m[Proc-0] 04:10:22 - INFO     - [BrowserPool] Contexto invalidado para proxy.soax.com[0m
+[31m[Proc-0] 04:10:22 - ERROR    - [Process-0] \u274c Excecao para tomasjins: HTTP 403 - Proxy/IP Banned[0m
+[32m[Proc-0] 04:10:22 - INFO     - [CSV Update] Updated tomasjins -> 'banned_403'[0m
+[32m[Proc-0] 04:10:22 - INFO     - [Process-0] \U0001f513 Proxy libertado: tomasjins (status=banned_403)[0m
+[32m[Proc-0] 04:10:22 - INFO     - [Process-0] \u2705 Task finalizada: tomasjins (0/1 slots ocupados)[0m
+[33m[Proc-0] 04:10:23 - WARNING  - [DDoSGuard] Health FAIL (process-0): status=0 text='Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.se/libcurl/c/libcurl-errors.html first for more details.' pause=not yet[0m
+[33m[Proc-0] 04:11:24 - WARNING  - [DDoSGuard] Health FAIL (process-0): status=0 text='Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.se/libcurl/c/libcurl-errors.html first for more details.' pause=opened 900s[0m
+[33m[Proc-0] 04:11:54 - WARNING  - [DDoSGuard] Circuit breaker aberto (process-0): pausando 870s antes de novo acesso ao MNE. motivo=health_probe status=0 text=Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.se/libcurl/c/libcurl-errors.html f[0m
+[33m[Proc-0] 04:16:54 - WARNING  - [DDoSGuard] Circuit breaker aberto (process-0): pausando 570s antes de novo acesso ao MNE. motivo=health_probe status=0 text=Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.se/libcurl/c/libcurl-errors.html f[0m
+[33m[Proc-0] 04:21:54 - WARNING  - [DDoSGuard] Circuit breaker aberto (process-0): pausando 270s antes de novo acesso ao MNE. motivo=health_probe status=0 text=Failed to perform, curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0). See https://curl.se/libcurl/c/libcurl-errors.html f[0m
